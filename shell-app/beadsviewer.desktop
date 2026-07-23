@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=BeadsViewer
+Comment=Viewer for the Beads (bd) issue tracker
+Exec=beadsviewer %U
+Icon=beadsviewer
+Terminal=false
+Categories=Development;ProjectManagement;
+MimeType=inode/directory;
+StartupNotify=true
