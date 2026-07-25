@@ -15,41 +15,7 @@
 #include <algorithm>
 #include <unistd.h>
 
-// ── recent-projects MRU (keyfile in the user config dir) ────────────────────
-static std::string recentPath() {
-    return std::string(g_get_user_config_dir()) + "/beadsviewer/recent.ini";
-}
-static std::vector<std::string> loadRecents() {
-    std::vector<std::string> out;
-    GKeyFile *kf = g_key_file_new();
-    if (g_key_file_load_from_file(kf, recentPath().c_str(), G_KEY_FILE_NONE, nullptr)) {
-        gsize n = 0;
-        gchar **arr = g_key_file_get_string_list(kf, "recent", "roots", &n, nullptr);
-        for (gsize i = 0; arr && i < n; i++) out.push_back(arr[i]);
-        if (arr) g_strfreev(arr);
-    }
-    g_key_file_free(kf);
-    return out;
-}
-static void saveRecents(const std::vector<std::string> &roots) {
-    GKeyFile *kf = g_key_file_new();
-    std::vector<const char *> ptrs;
-    for (auto &r : roots) ptrs.push_back(r.c_str());
-    g_key_file_set_string_list(kf, "recent", "roots", ptrs.data(), ptrs.size());
-    gchar *dir = g_path_get_dirname(recentPath().c_str());
-    g_mkdir_with_parents(dir, 0755);
-    g_free(dir);
-    g_key_file_save_to_file(kf, recentPath().c_str(), nullptr);
-    g_key_file_free(kf);
-}
-static void pushRecent(const std::string &root) {
-    if (root.empty()) return;
-    auto roots = loadRecents();
-    roots.erase(std::remove(roots.begin(), roots.end(), root), roots.end());
-    roots.insert(roots.begin(), root);
-    if (roots.size() > 10) roots.resize(10);
-    saveRecents(roots);
-}
+#include "BeadsRecent.h"   // shared MRU (also used by the plugin panel)
 
 // ── app state ────────────────────────────────────────────────────────────────
 struct App {
@@ -114,7 +80,7 @@ static void openWindowForProject(std::shared_ptr<BeadsProject> proj) {
     GtkWindow *winPtr = GTK_WINDOW(win);
     panel->setProjectChangedHandler([winPtr](std::shared_ptr<BeadsProject> p) {
         gtk_window_set_title(winPtr, titleForProject(p).c_str());
-        if (p && !p->projectRoot.empty()) { pushRecent(p->projectRoot); rebuildMenuBar(); }
+        if (p && !p->projectRoot.empty()) { BeadsRecent::push(p->projectRoot); rebuildMenuBar(); }
     });
     gtk_window_set_child(GTK_WINDOW(win), panel->widget());
     gtk_window_set_title(GTK_WINDOW(win), titleForProject(proj).c_str());
@@ -139,7 +105,7 @@ static void openWindowForProject(std::shared_ptr<BeadsProject> proj) {
 
     if (proj) {
         panel->bindProject(proj);
-        pushRecent(proj->projectRoot);
+        BeadsRecent::push(proj->projectRoot);
         rebuildMenuBar();
     }
 }
@@ -205,14 +171,12 @@ static void act_openrecent(GSimpleAction *, GVariant *param, gpointer) {
     if (proj) openWindowForProject(proj);
     else {
         // stale entry — drop it
-        auto roots = loadRecents();
-        roots.erase(std::remove(roots.begin(), roots.end(), std::string(root)), roots.end());
-        saveRecents(roots);
+        BeadsRecent::remove(root);
         rebuildMenuBar();
     }
 }
 static void act_clearrecent(GSimpleAction *, GVariant *, gpointer) {
-    saveRecents({});
+    BeadsRecent::clear();
     rebuildMenuBar();
 }
 
@@ -225,7 +189,7 @@ static void rebuildMenuBar() {
     g_menu_append(file, "Open Project Folder…", "app.open");
     // Open Recent submenu
     GMenu *recent = g_menu_new();
-    auto roots = loadRecents();
+    auto roots = BeadsRecent::load();
     if (roots.empty()) {
         GMenuItem *none = g_menu_item_new("(no recent projects)", nullptr);
         g_menu_append_item(recent, none);
@@ -311,7 +275,7 @@ static void on_startup(GtkApplication *, gpointer) {
 static void on_activate(GtkApplication *, gpointer) {
     // Resume the most-recent resolvable project; else open an empty window
     // (or the folder dialog on a truly empty first run).
-    for (auto &root : loadRecents()) {
+    for (auto &root : BeadsRecent::load()) {
         auto proj = BeadsProjectScanner::projectFromRoot(root);
         if (proj) { openWindowForProject(proj); return; }
     }

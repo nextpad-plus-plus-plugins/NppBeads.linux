@@ -1,8 +1,10 @@
 // BeadsPanel.cpp — see header. GTK4 + WebKitGTK 6.0 port of BeadsPanel.mm.
 
 #include "BeadsPanel.h"
+#include "BeadsRecent.h"
 #include <adwaita.h>
 #include <gio/gio.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -151,20 +153,32 @@ GtkWidget *BeadsPanel::makeToolbar() {
     addAct("reveal",       G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer s){ static_cast<BeadsPanel*>(s)->openBeadsDir(); }));
     addAct("unbind",       G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer s){ static_cast<BeadsPanel*>(s)->bindProject(nullptr); }));
     addAct("hide",         G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer s){ auto *p=static_cast<BeadsPanel*>(s); if (p->hideHandler_) p->hideHandler_(); }));
-    // Parameterized: pick a discovered project by its beadsDir.
-    GSimpleAction *pick = g_simple_action_new("pickproject", G_VARIANT_TYPE_STRING);
+    // "Open .beads folder…" — the folder-picker path (macOS _didPickOpenBeadsDir).
+    addAct("openfolder",   G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer s){ static_cast<BeadsPanel*>(s)->openBeadsFolderDialog(); }));
+    // Parameterized: pick a recent/discovered project by its ROOT (macOS
+    // _didPickRecentProject — validates and prunes stale entries).
+    GSimpleAction *pick = g_simple_action_new("pickroot", G_VARIANT_TYPE_STRING);
     g_signal_connect(pick, "activate",
         G_CALLBACK(+[](GSimpleAction *, GVariant *param, gpointer s){
-            const char *beadsDir = g_variant_get_string(param, nullptr);
-            auto *p = static_cast<BeadsPanel*>(s);
-            auto proj = BeadsProjectScanner::projectFromBeadsDir(beadsDir);
-            if (proj) p->bindProject(proj);
+            static_cast<BeadsPanel*>(s)->pickProjectRoot(
+                g_variant_get_string(param, nullptr));
         }), this);
     g_action_map_add_action(G_ACTION_MAP(ag), G_ACTION(pick));
     g_object_unref(pick);
     gtk_widget_insert_action_group(root_, "beads", G_ACTION_GROUP(ag));
     g_object_unref(ag);
+
+    // Persistent model, repopulated in place; a popover-map hook rebuilds it
+    // right before every popup so recency/discovery reflect the moment of the
+    // click (macOS builds the switcher menu on each chip tap).
+    projectMenu_ = g_menu_new();
+    gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(projectChip_), G_MENU_MODEL(projectMenu_));
     rebuildProjectMenu();
+    if (GtkPopover *pop = gtk_menu_button_get_popover(GTK_MENU_BUTTON(projectChip_))) {
+        g_signal_connect(pop, "map", G_CALLBACK(+[](GtkWidget *, gpointer s){
+            static_cast<BeadsPanel*>(s)->rebuildProjectMenu();
+        }), this);
+    }
 
     // View-mode dropdown.
     const char *modes[] = { "Dashboard", "Issues", "Insights", "Graph", "Board", "Activity", nullptr };
@@ -194,42 +208,149 @@ GtkWidget *BeadsPanel::makeToolbar() {
     return row;
 }
 
+// Mirrors macOS _buildProjectSwitcherMenu: current project (checked label) →
+// recents (persisted, validated) + session-discovered → "Open .beads folder…"
+// → "Unbind current project" → panel utilities. Candidates are gathered fresh
+// on every call; a content signature skips no-op rebuilds (this runs on every
+// popover map).
 void BeadsPanel::rebuildProjectMenu() {
-    GMenu *menu = g_menu_new();
+    // Candidate roots, MRU-ordered: persisted recents first, then projects
+    // discovered from session-seen file paths. Dedupe; skip the current one.
+    std::vector<std::string> roots = BeadsRecent::loadValidated();
+    for (auto &p : discoverProjects(12)) {
+        if (std::find(roots.begin(), roots.end(), p->projectRoot) == roots.end())
+            roots.push_back(p->projectRoot);
+    }
+    std::string cur = project_ ? project_->projectRoot : "";
+    roots.erase(std::remove(roots.begin(), roots.end(), cur), roots.end());
 
-    // Discovered projects section.
-    auto projects = discoverProjects(12);
-    if (!projects.empty()) {
+    // Signature: everything that affects menu content.
+    std::string sig = cur + "\x1e";
+    for (auto &r : roots) { sig += r; sig += "\x1f"; }
+    sig += project_ ? "P" : "-";
+    sig += hideHandler_ ? "H" : "-";
+    if (sig == projectMenuSig_) return;
+    projectMenuSig_ = sig;
+
+    g_menu_remove_all(projectMenu_);
+
+    // Current project row — checked, non-actionable (unregistered action
+    // renders it insensitive, like the macOS disabled state-on row).
+    if (project_) {
         GMenu *sec = g_menu_new();
-        for (auto &p : projects) {
-            std::string label = pathLeaf(p->projectRoot);
-            GMenuItem *item = g_menu_item_new(label.c_str(), nullptr);
-            g_menu_item_set_action_and_target_value(item, "beads.pickproject",
-                g_variant_new_string(p->beadsDir.c_str()));
-            g_menu_append_item(sec, item);
-            g_object_unref(item);
-        }
-        g_menu_append_section(menu, "Projects", G_MENU_MODEL(sec));
+        std::string label = "✓ " + pathLeaf(project_->projectRoot);
+        g_menu_append(sec, label.c_str(), "beads.__current");
+        g_menu_append_section(projectMenu_, nullptr, G_MENU_MODEL(sec));
         g_object_unref(sec);
     }
 
-    GMenu *actions = g_menu_new();
-    g_menu_append(actions, "Reload issues from disk", "beads.reload");
-    g_menu_append(actions, "Reload viewer",           "beads.reloadviewer");
-    g_menu_append(actions, "Reveal .beads/ folder",   "beads.reveal");
-    if (project_) g_menu_append(actions, "Unbind current project", "beads.unbind");
-    g_menu_append_section(menu, nullptr, G_MENU_MODEL(actions));
-    g_object_unref(actions);
-
-    if (hideHandler_) {
-        GMenu *hide = g_menu_new();
-        g_menu_append(hide, "Hide panel", "beads.hide");
-        g_menu_append_section(menu, nullptr, G_MENU_MODEL(hide));
-        g_object_unref(hide);
+    if (!roots.empty()) {
+        GMenu *sec = g_menu_new();
+        for (auto &r : roots) {
+            GMenuItem *item = g_menu_item_new(pathLeaf(r).c_str(), nullptr);
+            g_menu_item_set_action_and_target_value(item, "beads.pickroot",
+                g_variant_new_string(r.c_str()));
+            g_menu_append_item(sec, item);
+            g_object_unref(item);
+        }
+        g_menu_append_section(projectMenu_, "Projects", G_MENU_MODEL(sec));
+        g_object_unref(sec);
     }
 
-    gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(projectChip_), G_MENU_MODEL(menu));
-    g_object_unref(menu);
+    // Always present — with no recents and no discovery this is the menu's
+    // one real option, giving first-run users a way in (macOS parity).
+    {
+        GMenu *sec = g_menu_new();
+        g_menu_append(sec, "Open .beads folder…", "beads.openfolder");
+        if (project_) g_menu_append(sec, "Unbind current project", "beads.unbind");
+        g_menu_append_section(projectMenu_, nullptr, G_MENU_MODEL(sec));
+        g_object_unref(sec);
+    }
+
+    // Panel utilities (macOS keeps these on the right-click context menu; the
+    // Linux chip menu is the single home for both). Project-scoped entries
+    // only appear when a project is bound.
+    {
+        GMenu *sec = g_menu_new();
+        if (project_) {
+            g_menu_append(sec, "Reload issues from disk", "beads.reload");
+            g_menu_append(sec, "Reveal .beads/ folder",   "beads.reveal");
+        }
+        g_menu_append(sec, "Reload viewer", "beads.reloadviewer");
+        g_menu_append_section(projectMenu_, nullptr, G_MENU_MODEL(sec));
+        g_object_unref(sec);
+    }
+
+    if (hideHandler_) {
+        GMenu *sec = g_menu_new();
+        g_menu_append(sec, "Hide panel", "beads.hide");
+        g_menu_append_section(projectMenu_, nullptr, G_MENU_MODEL(sec));
+        g_object_unref(sec);
+    }
+}
+
+// macOS _didPickRecentProject: validate, bind; if .beads/ vanished since the
+// menu was built — friendly alert + prune the stale MRU entry.
+void BeadsPanel::pickProjectRoot(const std::string &root) {
+    if (root.empty()) return;
+    auto proj = BeadsProjectScanner::projectFromRoot(root);
+    if (!proj) {
+        BeadsRecent::remove(root);
+        projectMenuSig_.clear();   // force rebuild next popup
+        GtkAlertDialog *a = gtk_alert_dialog_new("Project not found");
+        std::string msg = "The .beads/ directory for this project no longer exists:\n\n" + root;
+        gtk_alert_dialog_set_detail(a, msg.c_str());
+        GtkRoot *win = gtk_widget_get_root(root_);
+        gtk_alert_dialog_show(a, GTK_IS_WINDOW(win) ? GTK_WINDOW(win) : nullptr);
+        g_object_unref(a);
+        return;
+    }
+    bindProject(proj);
+}
+
+// macOS _didPickOpenBeadsDir: folder picker; accepts either the .beads/
+// directory itself or its parent (project root); validates and binds.
+void BeadsPanel::openBeadsFolderDialog() {
+    GtkFileDialog *d = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(d, "Open .beads folder");
+    // Start at the current project's root so the user doesn't start from
+    // scratch; fall back to $HOME. (.beads is hidden — picking the project
+    // folder itself is the natural flow; Ctrl+H shows hidden dirs.)
+    std::string start = project_ ? project_->projectRoot : g_get_home_dir();
+    GFile *init = g_file_new_for_path(start.c_str());
+    gtk_file_dialog_set_initial_folder(d, init);
+    g_object_unref(init);
+
+    GtkRoot *win = gtk_widget_get_root(root_);
+    gtk_file_dialog_select_folder(d, GTK_IS_WINDOW(win) ? GTK_WINDOW(win) : nullptr, nullptr,
+        +[](GObject *src, GAsyncResult *res, gpointer s) {
+            auto *self = static_cast<BeadsPanel *>(s);
+            GFile *dir = gtk_file_dialog_select_folder_finish(GTK_FILE_DIALOG(src), res, nullptr);
+            if (!dir) return;   // cancelled
+            gchar *path = g_file_get_path(dir);
+            g_object_unref(dir);
+            if (!path) return;
+            std::string chosen = path;
+            g_free(path);
+            // Canonicalize to the .beads/ dir: accept it directly or append.
+            std::string beadsDir = chosen;
+            gchar *base = g_path_get_basename(chosen.c_str());
+            if (g_strcmp0(base, ".beads") != 0) beadsDir = chosen + "/.beads";
+            g_free(base);
+            auto proj = BeadsProjectScanner::projectFromBeadsDir(beadsDir);
+            if (!proj) {
+                GtkAlertDialog *a = gtk_alert_dialog_new("Not a beads project");
+                gtk_alert_dialog_set_detail(a,
+                    "The chosen directory doesn't contain a usable .beads/ "
+                    "folder (expected issues.jsonl or beads.db inside).");
+                GtkRoot *w = gtk_widget_get_root(self->root_);
+                gtk_alert_dialog_show(a, GTK_IS_WINDOW(w) ? GTK_WINDOW(w) : nullptr);
+                g_object_unref(a);
+                return;
+            }
+            self->bindProject(proj);
+        }, this);
+    g_object_unref(d);
 }
 
 // ── WebView ──────────────────────────────────────────────────────────────────
@@ -421,6 +542,7 @@ void BeadsPanel::bindProject(std::shared_ptr<BeadsProject> project) {
         project_ = project;
         ds_->bindToPath(project->jsonlPath);
         watcher_->watchPath(project->jsonlPath);
+        if (!project->projectRoot.empty()) BeadsRecent::push(project->projectRoot);
         refreshTitleBar();
         refreshStatusBar();
         if (projectChangedHandler_) projectChangedHandler_(project_);
@@ -436,6 +558,11 @@ void BeadsPanel::bindProject(std::shared_ptr<BeadsProject> project) {
     bdRunner_.reset();
 
     selectDataSourceForProject();
+
+    // Cross-session MRU feeding the switcher dropdown (shared with the
+    // standalone BeadsViewer — macOS shares the same defaults key).
+    if (project_ && !project_->projectRoot.empty())
+        BeadsRecent::push(project_->projectRoot);
 
     refreshTitleBar();
     refreshStatusBar();

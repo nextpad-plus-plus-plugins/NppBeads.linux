@@ -63,6 +63,8 @@ private:
     void setupWebView();
     GtkWidget *makeToolbar();
     void rebuildProjectMenu();
+    void pickProjectRoot(const std::string &root);
+    void openBeadsFolderDialog();
     void refreshStatusBar();
     void refreshTitleBar();
 
@@ -111,6 +113,8 @@ private:
     std::string resourcesDir_;
     GtkWidget *root_ = nullptr;
     GtkWidget *projectChip_ = nullptr;    // GtkMenuButton
+    GMenu *projectMenu_ = nullptr;        // persistent model, repopulated in place
+    std::string projectMenuSig_;          // content signature (skip no-op rebuilds)
     GtkWidget *viewModeDrop_ = nullptr;   // GtkDropDown
     GtkWidget *searchEntry_ = nullptr;
     GtkWidget *statusLabel_ = nullptr;

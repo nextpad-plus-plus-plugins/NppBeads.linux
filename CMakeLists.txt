@@ -22,7 +22,8 @@ add_library(beads_core STATIC
     src/BdDataSource.cpp
     src/BeadsProjectScanner.cpp
     src/BeadsWatcher.cpp
-    src/BeadsPoll.cpp)
+    src/BeadsPoll.cpp
+    src/BeadsRecent.cpp)
 target_include_directories(beads_core PUBLIC src "${NPP_LINUX_DIR}/src"
     "${NPP_LINUX_DIR}/scintilla/include")
 target_link_libraries(beads_core PUBLIC PkgConfig::GLIB)
