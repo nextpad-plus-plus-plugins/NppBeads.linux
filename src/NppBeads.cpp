@@ -230,6 +230,14 @@ static void cmdTogglePanel() {
                             (unsigned long)(uintptr_t)"NppBeads",
                             (long)(intptr_t)sPanel->widget());
         if (g_panelHandle == 0) { g_warning("[NppBeads] panel registration failed"); return; }
+        // Declare the reopen command so the host restores the panel after a
+        // restart (GH linux#18): module = getName() ("NppBeads"), cmdIndex 0
+        // = "Show Beads panel". Hosts < 1.1.0 return 0 — ignored.
+        NppPanelInfo info;
+        info.moduleName = PLUGIN_NAME;
+        info.cmdIndex   = 0;
+        npp(NPPM_DMM_SETPANELINFO, (unsigned long)(uintptr_t)g_panelHandle,
+            (long)(intptr_t)&info);
     }
 
     bool target = !panelIsShown();
