@@ -1,71 +1,97 @@
-# NppBeads — Beads panel for Notepad++ (macOS)
+# NppBeads — Beads panel for Nextpad++ (Linux) · BeadsViewer standalone app
 
-A dockable side panel that embeds the
-[Beads](https://github.com/steveyegge/beads) issue-graph viewer inside
-[Notepad++ for macOS](https://github.com/notepad-plus-plus-mac/notepad-plus-plus-macos).
+A dockable side panel that embeds the [Beads](https://github.com/gastownhall/beads)
+issue tracker inside [Nextpad++ for Linux](https://github.com/nextpad-plus-plus/nextpad-plus-plus-linux)
+— and, from the same codebase, **BeadsViewer**, a standalone GTK4 desktop
+application hosting the identical panel.
 
-Works **purely from `.beads/issues.jsonl`** — no Dolt server, no `bd`
-binary required for read-mode. All viewer assets are bundled; no external
-fetches, fully offline.
+All viewer assets are bundled and served over a custom `nppbeads://` scheme;
+no external fetches for local projects, fully offline.
 
-## What you get (v0.1 — Phase 1)
+## What you get (v1.0.2)
 
-- Auto-detects `.beads/` by walking up from the active file's directory
-- Reads `issues.jsonl`, synthesizes a SQLite DB in-memory via `sql.js`
-- Embeds the [dicklesworthstone beads-viewer](https://github.com/Dicklesworthstone/beads_viewer)
-  (GPL) — Dashboard, Issues, Insights, Graph with live PageRank /
-  betweenness / k-core computed client-side on the dependency graph
-- File-watcher with content-gated debounce — updates reflect writes from
-  `bd` or agents
-- Panel context menu: reveal `.beads/`, reload viewer, copy diagnostics,
-  show JSONL head
+- **Five surfaces** — Dashboard, Insights (PageRank / Betweenness / Critical
+  Path / k-core / articulation points / cycles + Project Velocity + Graph
+  Health), Activity feed with every issue's full detail modal, Kanban Board
+  with Raw/Effective status modes and drag-to-update, and a **3D
+  force-directed dependency graph** (2D switch, heatmap, critical path,
+  what-if overlays, facet filters)
+- **beads ≥ 1.3 native** — binds Dolt-only workspaces (no `issues.jsonl`
+  needed), renders live from the database via `bd export`, per-project Data
+  Source choice with an `issues.jsonl` escape hatch, opt-in **live events
+  feed** (`bd events tail --follow`) replacing the 2 s poll
+- **Remote read-only mode** — monitor any repository's
+  `.beads/issues.jsonl` over HTTP(S) with no clone and no bd: GitHub repos
+  (fine-grained token for private ones), self-hosted Gitea/Forgejo repo
+  URLs (raw layout derived automatically), or direct raw URLs; tokens live
+  in the Secret Service keyring
+- **Editor integration** (plugin) — bead-id detection (`bd-XXX`) in any open
+  buffer with Jump / Copy id / Create issue from selection, painted on a
+  host-allocated indicator
+- **More-actions (⋯) menu** — switch project, reload issues/viewer, reveal
+  `issues.jsonl`, Data Source + export, per-project **bd auto-push** opt-in,
+  copy diagnostics to clipboard, raw JSONL head
+- Writes (create / update / close / claim / deps / comments) go through the
+  `bd` CLI — install it separately; without it everything is read-only
 
-## Install (development)
+## Install
+
+**Plugin:** Plugins ▸ Plugins Admin inside Nextpad++ (catalog name
+“Beads”), or unzip `NppBeadsv<ver>-linux-<arch>.zip` from
+[Releases](https://github.com/nextpad-plus-plus-plugins/NppBeads.linux/releases)
+into `~/.local/share/nextpad++/plugins/`. Then **Plugins ▸ NppBeads ▸ Show
+Beads panel**.
+
+**Standalone app:** grab the `BeadsViewerv<ver>_<arch>` package for your
+distro from the same Releases page — `.deb` (amd64 / arm64 / i386 / armhf),
+`.rpm`, or Arch `.pkg.tar.zst` — or from the Snap Store:
 
 ```bash
-cd /path/to/nppPluginsMacOS/NppBeads
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(sysctl -n hw.ncpu)
-make install   # → ~/.notepad++/plugins/NppBeads/
+sudo snap install beads
 ```
 
-Restart Notepad++. Open any file inside a repo that contains a `.beads/`
-directory, then **Plugins ▸ NppBeads ▸ Show Beads panel** (⌘⌥⇧B).
+Launch with `BeadsViewer` (or from the applications grid). One window per
+project; the dock icon's **New Window** opens more.
+
+## Build from source
+
+```bash
+cd NppBeads.linux
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j4
+cmake --install build --component plugin          # plugin → ~/.local/share/nextpad++/plugins/
+cmake --install build --component app --prefix ~/.local   # BeadsViewer app
+```
+
+Dependencies (Ubuntu 24.04+): `libgtk-4-dev libadwaita-1-dev
+libwebkitgtk-6.0-dev libjson-glib-dev libsoup-3.0-dev libsecret-1-dev`.
+Packaging recipes for every shipped format live in `tools/` and
+`snap/snapcraft.yaml`.
 
 ## Architecture
 
 ```
-NppBeads panel
- ├── Title bar + status bar   (Cocoa NSView)
- ├── WKWebView                (serves nppbeads:// via WKURLSchemeHandler)
- │    └── bundled beads-viewer + bridge.js (JSONL → sql.js synthesis)
+BeadsPanel (GTK4)
+ ├── Title bar + status bar      (GtkBox · project chip, view switcher, ⋯ menu)
+ ├── WebKitGTK 6.0 WebView       (serves nppbeads:// via a URI scheme handler)
+ │    └── bundled viewer + bridge.js  (JSONL → sql.js synthesis, 3D graph)
  └── Data layer
-      ├── JsonlDataSource      (.beads/issues.jsonl reader + counts)
-      ├── BeadsProjectScanner  (walk-up auto-detect)
-      └── BeadsWatcher         (dispatch_source_t VNODE, debounced)
+      ├── JsonlDataSource        (issues.jsonl reader / adopted remote text)
+      ├── BdCommandRunner        (bd CLI: reads, writes, probe, export)
+      ├── BdEventsTail           (bd events journal follower, crash-orphan sweep)
+      ├── RemoteJsonlFetcher     (libsoup3 conditional polling, keyring tokens)
+      ├── BeadsProjectScanner    (walk-up auto-detect, Dolt-only aware)
+      └── BeadsWatcher / BeadsPoll  (file watcher + poll fallback)
+shell-app/                        BeadsViewer application around the panel
 ```
 
-All file loads go through `nppbeads://` (custom `WKURLSchemeHandler`)
-instead of `file://`, which fixes WebKit's file-origin quirks that
-otherwise break ES-module dynamic imports and `WebAssembly.instantiateStreaming`.
+Serving everything through `nppbeads://` instead of `file://` keeps
+ES-module dynamic imports and `WebAssembly.instantiateStreaming` working
+under WebKit's file-origin rules.
 
 ## Licenses
 
-- NppBeads itself: GPL-2.0-or-later (same as Notepad++)
-- Bundled [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer): GPL
-- Phase 2+ will include code ported from
-  [jdillon/vscode-beads](https://github.com/jdillon/vscode-beads)
-  (Apache-2.0, attributed in per-file headers)
-
-## Roadmap
-
-- **v0.1 — Phase 1 (shipped)** — JSONL read-only, viewer embedded
-- **v0.2 — Phase 2** — Native Kanban board, panel toolbar with view
-  switcher + search + dark-mode, header consolidation
-- **v0.3 — Phase 3** — `bd` CLI integration, write path (create /
-  update / close / dep add/remove), real-time polling
-- **v0.4 — Phase 4** — Native details view with inline edit, markdown,
-  dependency manager
-- **v0.5 — Phase 5** — Bead-ID CodeLens in open documents, tab
-  color-coding by open-issue density
+- NppBeads / BeadsViewer: GPL-3.0-or-later
+- Bundled viewer based on
+  [Dicklesworthstone/beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) (GPL)
+- Beads itself: [gastownhall/beads](https://github.com/gastownhall/beads)
