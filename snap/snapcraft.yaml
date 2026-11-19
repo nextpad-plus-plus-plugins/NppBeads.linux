@@ -2,7 +2,7 @@
 # recipe (see its header for the build/publish runbook: build locally with
 # `snapcraft pack --destructive-mode` from a staged copy — NEVER
 # remote-build — test with `snap install --dangerous`, publish to edge).
-name: beadsviewer
+name: beads
 title: BeadsViewer
 summary: Viewer for the Beads (bd) issue tracker
 description: |
@@ -27,11 +27,18 @@ platforms:
 
 # Own our GApplication id on the session bus (single instance + the dock's
 # New Window D-Bus activation) — same pattern as the app's dbus-nextpad slot.
-slots:
-  dbus-beadsviewer:
-    interface: dbus
-    bus: session
-    name: org.nextpadplusplus.BeadsViewer
+# Session-bus name slot (single instance + the dock's New Window D-Bus
+# activation). DISABLED for store uploads: a dbus slot fails the store's
+# automatic review ("human review required due to 'deny-connection'
+# constraint") — restoring it needs a one-time store approval / snap
+# declaration, the same path the nextpad snap went through. Without it the
+# app logs a bus-registration failure and runs non-single-instance; the
+# desktop action still opens windows (as separate processes).
+#slots:
+#  dbus-beadsviewer:
+#    interface: dbus
+#    bus: session
+#    name: org.nextpadplusplus.BeadsViewer
 
 # WebKitGTK spawns its helper processes by ABSOLUTE path
 # (/usr/lib/<triplet>/webkitgtk-6.0/WebKitNetworkProcess). WEBKIT_EXEC_PATH
@@ -83,7 +90,7 @@ parts:
                "$CRAFT_PART_INSTALL/usr/lib/aarch64-linux-gnu/webkitgtk-6.0"
 
 apps:
-  beadsviewer:
+  beads:
     command: usr/bin/BeadsViewer
     common-id: org.nextpadplusplus.BeadsViewer
     desktop: usr/share/applications/org.nextpadplusplus.BeadsViewer.desktop
