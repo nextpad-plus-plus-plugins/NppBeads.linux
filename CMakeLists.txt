@@ -99,6 +99,8 @@ install(TARGETS BeadsViewer RUNTIME DESTINATION bin)
 install(FILES resources/toolbar.png DESTINATION share/beadsviewer/resources)
 install(DIRECTORY resources/viewer DESTINATION share/beadsviewer/resources
     PATTERN ".git" EXCLUDE PATTERN ".DS_Store" EXCLUDE PATTERN ".gitignore" EXCLUDE)
-install(FILES shell-app/org.nextpadplusplus.BeadsViewer.desktop
+configure_file(shell-app/org.nextpadplusplus.BeadsViewer.desktop.in
+    ${CMAKE_BINARY_DIR}/org.nextpadplusplus.BeadsViewer.desktop @ONLY)
+install(FILES ${CMAKE_BINARY_DIR}/org.nextpadplusplus.BeadsViewer.desktop
     DESTINATION share/applications)
 install(DIRECTORY shell-app/icons/hicolor DESTINATION share/icons)
