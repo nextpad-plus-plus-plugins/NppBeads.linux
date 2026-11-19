@@ -135,7 +135,13 @@ const DB_STATE = {
 // Graph engine state (WASM)
 const GRAPH_STATE = {
   wasm: null,         // WASM module (bv_graph.js)
-  graph: null,        // DiGraph instance
+  graph: null,        // DiGraph instance (edges dependent → blocker; metrics)
+  // NppBeads: the same graph with edges blocker → dependent. The engine's
+  // whatIfClose / topWhatIf / actionableNodes follow out-edges to the
+  // issues a node unblocks, so on `graph` they answered backwards
+  // ("closing X unblocks X's own blockers"). Built in the same node order
+  // as `graph`, so node indices (and nodeMap) are shared.
+  flow: null,
   nodeMap: null,      // Map<string, number> - issue ID to node index
   ready: false,       // true when graph is loaded
 };
@@ -301,6 +307,12 @@ function cleanupWasm() {
     GRAPH_STATE.graph = null;
     GRAPH_STATE.ready = false;
     GRAPH_STATE.nodeMap = null;
+  }
+  if (GRAPH_STATE.flow && typeof GRAPH_STATE.flow.free === 'function') {
+    try { GRAPH_STATE.flow.free(); } catch (e) {
+      console.warn('[WASM Memory] Error freeing flow graph:', e);
+    }
+    GRAPH_STATE.flow = null;
   }
 
   console.log(`[WASM Memory] Cleanup complete. Tracked: ${WASM_ALLOCATIONS.trackCount}, Freed: ${WASM_ALLOCATIONS.freedCount}`);
@@ -618,7 +630,20 @@ function execScalar(sql, params = []) {
 /**
  * Initialize the WASM graph engine
  */
-async function initGraphEngine() {
+// NppBeads: overlapping calls share one in-flight init. Two concurrent
+// inits each instantiated the WASM module; the later instance replaced the
+// module's memory under graphs built on the earlier one, and engine calls
+// then trapped intermittently ("Unreachable code should not be executed").
+let graphEngineInit = null;
+function initGraphEngine() {
+  if (GRAPH_STATE.ready) return Promise.resolve(true);
+  if (!graphEngineInit) {
+    graphEngineInit = initGraphEngineOnce().finally(() => { graphEngineInit = null; });
+  }
+  return graphEngineInit;
+}
+
+async function initGraphEngineOnce() {
   if (GRAPH_STATE.ready) return true;
 
   // Check if we're already in fallback mode
@@ -644,6 +669,7 @@ async function initGraphEngine() {
 
     GRAPH_STATE.wasm = wasmModule;
     GRAPH_STATE.graph = new wasmModule.DiGraph();
+    GRAPH_STATE.flow = new wasmModule.DiGraph();
     GRAPH_STATE.nodeMap = new Map();
 
     // Load graph data from SQLite
@@ -664,16 +690,22 @@ async function initGraphEngine() {
 
       if (!GRAPH_STATE.nodeMap.has(from)) {
         const idx = GRAPH_STATE.graph.addNode(from);
+        GRAPH_STATE.flow.addNode(from);
         GRAPH_STATE.nodeMap.set(from, idx);
       }
       if (!GRAPH_STATE.nodeMap.has(to)) {
         const idx = GRAPH_STATE.graph.addNode(to);
+        GRAPH_STATE.flow.addNode(to);
         GRAPH_STATE.nodeMap.set(to, idx);
       }
 
       GRAPH_STATE.graph.addEdge(
         GRAPH_STATE.nodeMap.get(from),
         GRAPH_STATE.nodeMap.get(to)
+      );
+      GRAPH_STATE.flow.addEdge(
+        GRAPH_STATE.nodeMap.get(to),
+        GRAPH_STATE.nodeMap.get(from)
       );
     }
 
@@ -757,12 +789,12 @@ function whatIfClose(issueId) {
   if (idx === undefined) return null;
 
   const closedSet = buildClosedSet();
-  const result = GRAPH_STATE.graph.whatIfClose(idx, closedSet);
+  const result = GRAPH_STATE.flow.whatIfClose(idx, closedSet);
 
   // Convert node indices back to issue IDs
   if (result && result.cascade_ids) {
-    result.cascade_issue_ids = result.cascade_ids
-      .map(i => GRAPH_STATE.graph.nodeId(i))
+    result.cascade_issue_ids = Array.from(result.cascade_ids)
+      .map(i => GRAPH_STATE.flow.nodeId(i))
       .filter(Boolean);
   }
 
@@ -776,12 +808,12 @@ function topWhatIf(limit = 10) {
   if (!GRAPH_STATE.ready) return [];
 
   const closedSet = buildClosedSet();
-  const results = GRAPH_STATE.graph.topWhatIf(closedSet, limit);
+  const results = GRAPH_STATE.flow.topWhatIf(closedSet, limit);
 
   // Enrich with issue IDs
   return (results || []).map(item => ({
     ...item,
-    issueId: GRAPH_STATE.graph.nodeId(item.node),
+    issueId: GRAPH_STATE.flow.nodeId(item.node),
     result: item.result,
   }));
 }
@@ -793,10 +825,10 @@ function getActionableIssues() {
   if (!GRAPH_STATE.ready) return [];
 
   const closedSet = buildClosedSet();
-  const indices = GRAPH_STATE.graph.actionableNodes(closedSet);
+  const indices = GRAPH_STATE.flow.actionableNodes(closedSet);
 
-  return (indices || [])
-    .map(idx => GRAPH_STATE.graph.nodeId(idx))
+  return Array.from(indices || [])
+    .map(idx => GRAPH_STATE.flow.nodeId(idx))
     .filter(Boolean);
 }
 
@@ -1036,7 +1068,14 @@ function getGraphViewData() {
     WHERE type = 'blocks'
   `);
 
-  return { issues, dependencies };
+  // NppBeads: epic membership (Epic Flow + the Epic filter) — child → parent.
+  const hierarchy = execQuery(`
+    SELECT issue_id, depends_on_id
+    FROM dependencies
+    WHERE type = 'parent-child'
+  `);
+
+  return { issues, dependencies, hierarchy };
 }
 
 /**
@@ -1221,6 +1260,15 @@ function countSearchIssues(term, filters = {}) {
 /**
  * Get project statistics
  */
+// NppBeads: an issue is blocked only while a `blocks` prerequisite is still
+// open — closed blockers don't count (`bd ready` semantics, as in the
+// Activity view's Ready / Blocked filter the dashboard cards open).
+const HAS_OPEN_BLOCKER = `EXISTS (
+    SELECT 1 FROM dependencies d JOIN issues b ON b.id = d.depends_on_id
+    WHERE d.issue_id = issue_overview_mv.id
+    AND (d.type = 'blocks' OR d.type = '')
+    AND b.status <> 'closed')`;
+
 function getStats() {
   const stats = {};
 
@@ -1240,19 +1288,18 @@ function getStats() {
     console.error('[Stats] Error loading status counts:', err);
   }
 
-  // Count blocked (has blocked_by_ids and status is open/in_progress)
+  // Count blocked (open/in_progress waiting on at least one open blocker)
   stats.blocked = execScalar(`
     SELECT COUNT(*) FROM issue_overview_mv
-    WHERE blocked_by_ids IS NOT NULL
-    AND blocked_by_ids <> ''
-    AND status IN ('open', 'in_progress')
+    WHERE status IN ('open', 'in_progress')
+    AND ${HAS_OPEN_BLOCKER}
   `) || 0;
 
   // Count actionable (open/in_progress with NO open blockers)
   stats.actionable = execScalar(`
     SELECT COUNT(*) FROM issue_overview_mv
     WHERE status IN ('open', 'in_progress')
-    AND (blocked_by_ids IS NULL OR blocked_by_ids = '')
+    AND NOT ${HAS_OPEN_BLOCKER}
   `) || 0;
 
   // Total
@@ -1268,7 +1315,7 @@ function getQuickWins(limit = 5) {
   return execQuery(`
     SELECT * FROM issue_overview_mv
     WHERE status IN ('open', 'in_progress')
-    AND (blocked_by_ids IS NULL OR blocked_by_ids = '')
+    AND NOT ${HAS_OPEN_BLOCKER}
     ORDER BY blocks_count DESC, triage_score DESC
     LIMIT ?
   `, [limit]);
@@ -1949,6 +1996,9 @@ function syncFiltersToURL(view, filters, sort, searchQuery) {
   }
 }
 
+// NppBeads: the Graph view's facet bar (facets.js handle), built once.
+let graphFacets = null;
+
 // ============================================================================
 // Router - Hash-based SPA navigation
 // ============================================================================
@@ -2046,6 +2096,23 @@ function navigateToIssue(id) {
 function navigateToIssues(filters = {}, sort = 'priority', search = '') {
   const params = filtersToURL(filters, sort, search);
   navigate(`/issues${params ? '?' + params : ''}`);
+}
+
+/**
+ * NppBeads: the Issues view is retired — issues open in the Activity view
+ * (app/activity.html), which reads these query parameters on load:
+ *   open    issue id whose detail modal to open
+ *   status  comma-separated statuses to preset the Status facet with
+ *   blocked 'ready' | 'blocked' preset for the Blocked facet
+ */
+function openInActivity(params = {}) {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    const val = Array.isArray(v) ? v.join(',') : v;
+    if (val) q.set(k, val);
+  }
+  const query = q.toString();
+  window.location.href = 'app/activity.html' + (query ? '?' + query : '');
 }
 
 /**
@@ -2355,6 +2422,11 @@ function beadsApp() {
     forceGraphError: null,
     forceGraphModule: null,
     graphDetailNode: null, // Currently selected node for detail pane
+    // NppBeads: Find-node query, typed in the panel toolbar's search field
+    // (bridge.js __nppGraphSearch), and the top bar's "N of M shown" line.
+    graphQuery: '',
+    graphSummary: '',
+    graphShown: { open: 0, deferred: 0, closed: 0 },   // the "Showing" box: visible nodes
 
     // Graph loading stages: 'init' | 'loading-data' | 'computing-metrics' | 'simulating' | null
     graphLoadingStage: null,
@@ -2371,6 +2443,10 @@ function beadsApp() {
     // Alpine root drives them, the graph module applies them.
     graphShowFireMarks: true,
     graphShowParticles: false,
+    // Issue titles under the id labels; graph.js remembers the choice.
+    graphShowTitles: (() => {
+      try { return localStorage.getItem('nppbeads.graph.showTitles') === 'true'; } catch { return false; }
+    })(),
 
     // Critical path highlighting
     showCriticalPath: false,
@@ -2429,11 +2505,11 @@ function beadsApp() {
           const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
           window.scrollTo({ top: 0, behavior: prefersReducedMotion ? 'auto' : 'smooth' });
         }
-        // NppBeads: when leaving Graph, clear Find-node isolation so the
-        // graph doesn't come back filtered next time the user visits.
+        // NppBeads: when leaving Graph, clear Find-node isolation — the
+        // panel clears its search field on views without search, so the
+        // graph must not come back filtered by a query nobody can see.
         if (oldView === 'graph' && newView !== 'graph') {
-          this.graphSearchQuery = '';
-          this.graphSearchResult = null;
+          this.graphQuery = '';
           if (this.forceGraphModule?.searchAndIsolate) {
             this.forceGraphModule.searchAndIsolate('');
           }
@@ -2546,11 +2622,14 @@ function beadsApp() {
         // - Ctrl/Meta+click highlights dependency paths
         if (ev && (ev.shiftKey || ev.ctrlKey || ev.metaKey)) return;
 
-        // Open the issue modal on double-click.
+        // Open the issue on double-click (in the Activity view's modal).
         if (ev && typeof ev.detail === 'number' && ev.detail < 2) return;
 
-        this.selectIssue(nodeId);
+        openInActivity({ open: nodeId });
       });
+
+      // NppBeads: native pushed newer data (bd wrote) — refresh in place.
+      window.addEventListener('npp-beads:jsonl-reloaded', () => this.refreshLiveData());
 
       try {
         this.loadingMessage = 'Loading sql.js WebAssembly...';
@@ -2586,20 +2665,7 @@ function beadsApp() {
             });
         }
 
-        this.topPicks = getTopPicks(5);
-        this.recentIssues = getRecentIssues(10);
-        this.topByPageRank = getTopByPageRank(10);
-        this.topByTriageScore = getTopByTriageScore(10);
-        this.topBlockers = getTopBlockers(10);
-
-        // Dashboard data
-        this.quickWins = getQuickWins(5);
-        this.blockersToClose = getBlockersToClose(5);
-        this.distributionByType = getDistributionByType();
-        this.distributionByPriority = getDistributionByPriority();
-
-        // Load filter options for dropdowns
-        this.filterOptions = getFilterOptions();
+        this._loadDashboardData();
 
         // Load issues for list view (initial data)
         this.loadIssues();
@@ -2613,19 +2679,7 @@ function beadsApp() {
         this.loadingMessage = 'Loading graph engine...';
         this.graphReady = await initGraphEngine();
         DIAGNOSTICS.graphWasm = this.graphReady;
-        if (this.graphReady) {
-          this.topKSet = getTopKSet(5);
-          this.topByBetweenness = getTopByBetweenness(10);
-          this.topByCriticalPath = getTopByCriticalPath(10);
-          this.cycleInfo = getCycleInfo();
-          this.topImpactIssues = topWhatIf(10);
-          // Additional TUI-style metrics
-          this.topByHITSHub = getTopByHITSHub(10);
-          this.topByHITSAuth = getTopByHITSAuth(10);
-          this.topByKCore = getTopByKCore(10);
-          this.articulationPoints = getArticulationPoints();
-          this.criticalPathSlack = getIssuesBySlack(10, true); // Zero slack = critical path
-        }
+        this._loadGraphMetricsData();
 
         // Listen for hash changes (browser back/forward)
         window.addEventListener('hashchange', () => this.handleHashChange());
@@ -2677,6 +2731,7 @@ function beadsApp() {
         }
 
         this.loading = false;
+        if (this._liveRefreshPending) this.refreshLiveData();
       } catch (err) {
         console.error('Init failed:', err);
         this.error = err.message || 'Failed to load database';
@@ -2699,6 +2754,12 @@ function beadsApp() {
       const route = parseRoute(hash);
 
       // Handle route
+      // NppBeads: the Issues view is retired; its routes open Activity.
+      if (route.view === 'issue' || route.view === 'issues') {
+        openInActivity(route.view === 'issue' ? { open: route.params.id } : {});
+        return;
+      }
+
       switch (route.view) {
         case 'issue':
           // Issue detail view
@@ -2780,7 +2841,7 @@ function beadsApp() {
         this.graphLoadingStage = 'loading-data';
 
         // Check for empty data BEFORE initializing ForceGraph to avoid wasteful init
-        const { issues, dependencies } = getGraphViewData();
+        const { issues, dependencies, hierarchy } = getGraphViewData();
 
         if (!issues || issues.length === 0) {
           console.warn('[ForceGraph] No issues to display');
@@ -2870,7 +2931,14 @@ function beadsApp() {
         this.graphSimulationDone = false;
 
         console.log(`[ForceGraph] Loading ${issues.length} issues, ${dependencies.length} dependencies`);
+        this.forceGraphModule.setHierarchy(hierarchy);
         this.forceGraphModule.loadData(issues, dependencies, precomputedLayout);
+        this.setupGraphFacets();
+        if (typeof window.__nppGraphPendingQuery === 'string') {
+          this.graphQuery = window.__nppGraphPendingQuery.trim();
+          delete window.__nppGraphPendingQuery;
+        }
+        this.applyGraphFilters({ fit: false });
 
         // Try to load history data for time-travel feature (bv-z38b)
         try {
@@ -2930,6 +2998,7 @@ function beadsApp() {
      */
     graphZoomIn() {
       if (!this.forceGraphModule || !this.forceGraphReady) return;
+      if (this.forceGraphModule.zoomBy) { this.forceGraphModule.zoomBy(1.5); return; }
       const graph = this.forceGraphModule.getGraph?.();
       if (graph && typeof graph.zoom === 'function') {
         const currentZoom = graph.zoom();
@@ -2942,6 +3011,7 @@ function beadsApp() {
      */
     graphZoomOut() {
       if (!this.forceGraphModule || !this.forceGraphReady) return;
+      if (this.forceGraphModule.zoomBy) { this.forceGraphModule.zoomBy(1 / 1.5); return; }
       const graph = this.forceGraphModule.getGraph?.();
       if (graph && typeof graph.zoom === 'function') {
         const currentZoom = graph.zoom();
@@ -2961,29 +3031,214 @@ function beadsApp() {
     },
 
     /**
-     * Search for a node in the graph and center on it
+     * NppBeads: build the graph's facet bar (facets.js) once, reading the
+     * graph module's issue records.
      */
-    // NppBeads: Find-node now ISOLATES matches + their 1-level neighbors.
-    // Empty query clears the isolation and reshows the full graph.
-    graphSearchNode(query) {
-      if (!this.forceGraphModule) return null;
-      const isolate = this.forceGraphModule.searchAndIsolate;
-      if (typeof isolate !== 'function') return null;
-      const q = (query || '').trim();
-      const res = isolate(q);
-      if (!q) return null;                          // cleared — not a "result"
-      if (!res || res.matches === 0) return null;   // no match
+    setupGraphFacets() {
+      if (graphFacets || !window.NppFacets) return;
+      const container = document.getElementById('graph-facets');
+      if (!container) return;
+      const mod = this.forceGraphModule;
+      const STATUS_LABELS = {
+        open: 'Open', in_progress: 'In Progress', blocked: 'Blocked', closed: 'Closed',
+        deferred: 'Deferred', pinned: 'Pinned', hooked: 'Hooked',
+      };
+      const TYPE_ICONS = { bug: '🪲', feature: '✨', task: '✓', epic: '⬢', chore: '•' };
+      graphFacets = window.NppFacets.create({
+        container,
+        beads:         () => mod.getIssues(),
+        typeOf:        (b) => b.type,
+        priorityOf:    (b) => b.priority,
+        statusOf:      (b) => b.status,
+        assigneeOf:    (b) => b.assignee,
+        blockingState: (b) => mod.getBlockingState(b.id),
+        typeLabel:     (v) => (TYPE_ICONS[v] || TYPE_ICONS.task) + ' ' + v,
+        statusLabel:   (v) => STATUS_LABELS[v] || v,
+        onChange:      () => this.applyGraphFilters(),
+        storageKey:    window.NppFacets.storageKey('graph'),
+        // Epic: an epic and everything under it (parent-child, any depth).
+        // Open epics first, then closed; each by id.
+        epics: {
+          list: () => (mod.getIssues() || [])
+            .filter(b => b.type === 'epic')
+            .sort((a, b) => ((a.status === 'closed') - (b.status === 'closed')) ||
+                            a.id.localeCompare(b.id, undefined, { numeric: true }))
+            .map(b => ({
+              id: b.id,
+              label: b.id + ' · ' + (b.title || '(no title)') +
+                     (b.status === 'closed' ? ' (closed)' : ''),
+            })),
+          of: (b) => mod.getEpicsOf(b.id),
+        },
+      });
+    },
 
-      // Re-fit view to the filtered graph after the next tick so the
-      // force simulation has time to produce coordinates.
-      setTimeout(() => {
-        const graph = this.forceGraphModule.getGraph?.();
-        if (graph && typeof graph.zoomToFit === 'function') {
-          graph.zoomToFit(400, 40);
+    /**
+     * NppBeads: apply the facet bar and the toolbar's Find-node query to
+     * the graph, then refresh the "N of M shown" summary.
+     */
+    applyGraphFilters({ fit = true } = {}) {
+      const mod = this.forceGraphModule;
+      if (!mod || !this.forceGraphReady || !mod.setFacetPredicate) return;
+      const facetsOn = !!graphFacets && graphFacets.active();
+      mod.setFacetPredicate(facetsOn ? (b) => graphFacets.passes(b) : null);
+      const q = (this.graphQuery || '').trim();
+      const res = mod.searchAndIsolate(q);
+      this.updateGraphSummary(res);
+      if (fit && res.visible > 0) {
+        // Re-fit after the next tick so the simulation has coordinates.
+        setTimeout(() => {
+          const graph = mod.getGraph?.();
+          if (graph && typeof graph.zoomToFit === 'function') graph.zoomToFit(400, 40);
+        }, 150);
+      }
+    },
+
+    /**
+     * NppBeads: the toolbar's "N of M shown" line and the open / deferred /
+     * closed counts, from a searchAndIsolate()/refreshData() result.
+     */
+    updateGraphSummary(res) {
+      const mod = this.forceGraphModule;
+      const facetsOn = !!graphFacets && graphFacets.active();
+      const q = (this.graphQuery || '').trim();
+      const issues = mod.getIssues() || [];
+      const total = issues.length;
+      const plural = (n, one, many) => n + ' ' + (n === 1 ? one : many);
+      // Matches that also pass the facets (the rest of what's shown are
+      // their direct neighbours).
+      let matches = res.matches;
+      if (q && facetsOn && res.ids) {
+        const byId = new Map(issues.map(b => [b.id, b]));
+        matches = res.ids.filter(id => byId.has(id) && graphFacets.passes(byId.get(id))).length;
+      }
+      if (!q && !facetsOn) {
+        this.graphSummary = plural(total, 'issue', 'issues');
+      } else if (q && matches === 0) {
+        this.graphSummary = 'No issues match “' + q + '”' + (res.matches ? ' with these filters' : '');
+      } else {
+        this.graphSummary = res.visible + ' of ' + total + ' shown' +
+          (q ? ' · ' + plural(matches, 'match', 'matches') + ' for “' + q + '”' : '');
+      }
+      const shown = mod.getGraph?.()?.graphData?.().nodes || [];
+      const closed   = shown.filter(n => n.status === 'closed').length;
+      const deferred = shown.filter(n => n.status === 'deferred').length;
+      this.graphShown = { open: shown.length - closed - deferred, deferred, closed };
+    },
+
+    /**
+     * NppBeads: Dashboard lists and counts, from the current DB. Run at
+     * init and on every live refresh.
+     */
+    _loadDashboardData() {
+      this.meta = getMeta();
+      this.stats = getStats();
+      this.topPicks = getTopPicks(5);
+      this.recentIssues = getRecentIssues(10);
+      this.topByPageRank = getTopByPageRank(10);
+      this.topByTriageScore = getTopByTriageScore(10);
+      this.topBlockers = getTopBlockers(10);
+
+      // Dashboard data
+      this.quickWins = getQuickWins(5);
+      this.blockersToClose = getBlockersToClose(5);
+      this.distributionByType = getDistributionByType();
+      this.distributionByPriority = getDistributionByPriority();
+
+      // Load filter options for dropdowns
+      this.filterOptions = getFilterOptions();
+    },
+
+    /**
+     * NppBeads: Insights metrics from the WASM graph engine. Run at init and
+     * on every live refresh (after the engine is rebuilt).
+     */
+    _loadGraphMetricsData() {
+      if (!this.graphReady) return;
+      this.topKSet = getTopKSet(5);
+      this.topByBetweenness = getTopByBetweenness(10);
+      this.topByCriticalPath = getTopByCriticalPath(10);
+      this.cycleInfo = getCycleInfo();
+      this.topImpactIssues = topWhatIf(10);
+      // Additional TUI-style metrics
+      this.topByHITSHub = getTopByHITSHub(10);
+      this.topByHITSAuth = getTopByHITSAuth(10);
+      this.topByKCore = getTopByKCore(10);
+      this.articulationPoints = getArticulationPoints();
+      this.criticalPathSlack = getIssuesBySlack(10, true); // Zero slack = critical path
+    },
+
+    /**
+     * NppBeads: live refresh. bridge.js fires 'npp-beads:jsonl-reloaded'
+     * when native pushes changed data (a status change in bd, another
+     * agent's write). This page used to keep the data it loaded with, so
+     * the Graph showed old statuses until the view was switched. Rebuild
+     * the DB and everything derived from it in place; the Graph keeps its
+     * layout, camera and filters (graph.js refreshData). Pushes that land
+     * while a refresh (or init) runs are coalesced into one more pass.
+     */
+    async refreshLiveData() {
+      if (this.loading || this.error || this._liveRefreshRunning) {
+        this._liveRefreshPending = true;
+        return;
+      }
+      this._liveRefreshRunning = true;
+      try {
+        do {
+          this._liveRefreshPending = false;
+          await this._reloadLiveData();
+        } while (this._liveRefreshPending);
+      } catch (err) {
+        console.warn('[NppBeads] live refresh failed:', err);
+      } finally {
+        this._liveRefreshRunning = false;
+      }
+    },
+
+    async _reloadLiveData() {
+      // bridge.js serves ./beads.sqlite3 synthesized from the newest JSONL.
+      const SQL = await initSqlJs();
+      const resp = await fetch('./beads.sqlite3');
+      if (!resp.ok) throw new Error('database fetch failed: ' + resp.status);
+      const fresh = new SQL.Database(new Uint8Array(await resp.arrayBuffer()));
+      const old = DB_STATE.db;
+      DB_STATE.db = fresh;
+      if (old && old !== fresh) { try { old.close(); } catch {} }
+
+      this._loadDashboardData();
+      DIAGNOSTICS.issueCount = this.stats.total || 0;
+      if (this.graphReady) {
+        cleanupWasm();
+        this.graphReady = await initGraphEngine();
+        DIAGNOSTICS.graphWasm = this.graphReady;
+      }
+      this._loadGraphMetricsData();
+
+      const ghd = getGraphViewData();
+      if (window.bvCharts) {
+        try { window.bvCharts.update(ghd.issues, ghd.dependencies); }
+        catch (e) { console.warn('[Charts] update failed:', e); }
+      }
+      if (this.triageData) {
+        try {
+          this.triageData.project_health = computeProjectHealth(
+            ghd.issues, ghd.dependencies, this.cycleInfo, this.graphReady);
+        } catch (e) { console.warn('[Viewer] project_health compute failed:', e); }
+      }
+
+      const mod = this.forceGraphModule;
+      if (this.forceGraphReady && mod && typeof mod.refreshData === 'function') {
+        const res = mod.refreshData(ghd.issues, ghd.dependencies, ghd.hierarchy);
+        if (res) this.updateGraphSummary(res);
+        if (this.graphDetailNode) {
+          const id = this.graphDetailNode.id;
+          const nodes = mod.getGraph?.()?.graphData?.().nodes || [];
+          const n = nodes.find(x => x.id === id);
+          if (n) this.graphDetailNode = n;
+          else if (!ghd.issues.some(i => i.id === id)) this.graphDetailNode = null;
         }
-      }, 150);
-      // Return a "found" marker for the search UI's x-show pathways.
-      return { id: q, matches: res.matches, visible: res.visible };
+      }
+      console.log('[NppBeads] live refresh: ' + ghd.issues.length + ' issues');
     },
 
     /**
@@ -3177,7 +3432,15 @@ function beadsApp() {
      * Show issue detail (navigates to issue route)
      */
     showIssue(id) {
-      navigateToIssue(id);
+      openInActivity({ open: id });
+    },
+
+    /**
+     * NppBeads: dashboard stat cards open the Activity view with its
+     * Status / Blocked facets preset (the Issues list is retired).
+     */
+    openActivityFiltered(status, blocked = '') {
+      openInActivity({ status, blocked });
     },
 
     /**
@@ -3471,6 +3734,14 @@ function beadsApp() {
       this.graphShowFireMarks = !this.graphShowFireMarks;
       if (this.forceGraphModule?.setFireMarksEnabled) {
         this.forceGraphModule.setFireMarksEnabled(this.graphShowFireMarks);
+      }
+    },
+
+    // NppBeads: toggle issue titles under the id labels.
+    toggleGraphTitles() {
+      this.graphShowTitles = !this.graphShowTitles;
+      if (this.forceGraphModule?.setTitlesEnabled) {
+        this.forceGraphModule.setTitlesEnabled(this.graphShowTitles);
       }
     },
 

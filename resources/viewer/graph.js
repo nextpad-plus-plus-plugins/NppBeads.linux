@@ -37,7 +37,8 @@ const darkPalette = {
         open: '#50FA7B',
         in_progress: '#FFB86C',
         blocked: '#FF5555',
-        closed: '#6272A4'
+        closed: '#6272A4',
+        deferred: '#BD93F9'
     },
     priority: {
         0: '#FF0000', 1: '#FF5555', 2: '#FFB86C', 3: '#F1FA8C', 4: '#6272A4'
@@ -65,7 +66,8 @@ const lightPalette = {
 
     status: {
         open: '#10b981', in_progress: '#f59e0b',
-        blocked: '#ef4444', closed: '#6b7280'
+        blocked: '#ef4444', closed: '#6b7280',
+        deferred: '#8b5cf6'
     },
     priority: {
         0: '#dc2626', 1: '#ef4444', 2: '#f59e0b', 3: '#ca8a04', 4: '#6b7280'
@@ -265,10 +267,14 @@ const DEFAULT_EXPORT_PRESET = 'spread';
 // STATE MANAGEMENT
 // ============================================================================
 
+const TITLES_KEY = 'nppbeads.graph.showTitles';
+const TITLE_MAX = 50;   // longest title shown under a node, "..." included
+
 class GraphStore {
     constructor() {
         this.graph = null;
         this.wasmGraph = null;
+        this.wasmFlowGraph = null;   // blocker → dependent, for what-if
         this.wasmReady = false;
         this.container = null;
 
@@ -334,11 +340,23 @@ class GraphStore {
             // NppBeads: fire glyphs on P0/P1 nodes. On by default; users
             // can turn off from the graph settings panel.
             showFireMarks: true,
+            // NppBeads: issue title as a second label line under the id.
+            // Off by default; remembered (Display panel "Titles").
+            showTitles: (() => {
+                try { return localStorage.getItem(TITLES_KEY) === 'true'; } catch (_) { return false; }
+            })(),
         };
         // NppBeads: when non-null, only these node IDs (plus their direct
         // neighbors) are shown — driven by the Find-node search. null
         // means "no isolation, show everything that passes filters".
         this.isolateNodes = null;
+        // NppBeads: Type/Priority/Status/Assignee/Blocked/Blocking facets
+        // (facets.js) as a predicate over issues; null = no facet filter.
+        this.facetPredicate = null;
+        // NppBeads: parent-child edges {issue_id: child, depends_on_id:
+        // parent}, kept apart from `dependencies` (blocks only) so metrics
+        // and blocking state never see them. Set via setHierarchy().
+        this.hierarchy = [];
 
         // Animation state
         this.animationFrame = null;
@@ -370,6 +388,9 @@ const store = new GraphStore();
 //  'dependency' → arrow points from dependent to prerequisite (build-system
 //                 / "depends-on" convention). What the graph rendered before
 //                 this option existed.
+//  'epic'       → draws the parent-child hierarchy instead of `blocks`
+//                 edges: arrow from each parent (epic) to its children, so
+//                 every epic's items gather around it ("Epic Flow").
 //
 // Persisted to localStorage so the user's choice sticks across reloads. The
 // underlying WASM DiGraph (and every metric computed from it — PageRank,
@@ -380,12 +401,12 @@ const ARROW_DIR_KEY = 'nppbeads.arrowDirection';
 let arrowDirection = (() => {
     try {
         const saved = localStorage.getItem(ARROW_DIR_KEY);
-        return (saved === 'dependency' || saved === 'execution') ? saved : 'execution';
+        return ['dependency', 'execution', 'epic'].indexOf(saved) !== -1 ? saved : 'execution';
     } catch (_) { return 'execution'; }
 })();
 export function getArrowDirection() { return arrowDirection; }
 export function setArrowDirection(dir) {
-    const next = (dir === 'dependency') ? 'dependency' : 'execution';
+    const next = (dir === 'dependency' || dir === 'epic') ? dir : 'execution';
     if (next === arrowDirection) return;
     arrowDirection = next;
     try { localStorage.setItem(ARROW_DIR_KEY, next); } catch (_) {}
@@ -397,6 +418,199 @@ export function setArrowDirection(dir) {
     }
 }
 
+// ============================================================================
+// 2D / 3D RENDERER (NppBeads)
+// ============================================================================
+//  '3d' → 3d-force-graph (WebGL, vendor/graph3d.min.js). DEFAULT.
+//  '2d' → force-graph (canvas), the original renderer.
+//
+// Both renderers share prepareGraphData(), the filters, the metrics and the
+// color/size/opacity rules (getNodeColor & co.), so every feature that only
+// changes WHAT is shown works in both. Only the drawing and camera code is
+// per-renderer. Persisted to localStorage like the arrow direction.
+const DIMENSION_KEY = 'nppbeads.graphDimension';
+let graphDimension = (() => {
+    try {
+        const saved = localStorage.getItem(DIMENSION_KEY);
+        return (saved === '2d' || saved === '3d') ? saved : '3d';
+    } catch (_) { return '3d'; }
+})();
+
+function is3D() { return graphDimension === '3d'; }
+
+// Force factories for the active renderer. d3-force-3d has the same API as
+// d3 v7's forces but also moves nodes along z.
+function F() { return is3D() ? window.d3Force3d : d3; }
+
+function can3D() {
+    if (typeof window.ForceGraph3D !== 'function' || !window.THREE ||
+        typeof window.SpriteText !== 'function' || !window.d3Force3d) return false;
+    try {
+        const canvas = document.createElement('canvas');
+        return !!(canvas.getContext('webgl2') || canvas.getContext('webgl'));
+    } catch (_) { return false; }
+}
+
+export function getDimension() { return graphDimension; }
+
+/**
+ * Switch between the 2D and 3D renderer. Rebuilds the renderer in the same
+ * container and reloads the current data; returns the dimension actually in
+ * effect (3D falls back to 2D when WebGL or the 3D bundle is unavailable).
+ */
+export function setDimension(dim) {
+    const next = (dim === '2d') ? '2d' : '3d';
+    try { localStorage.setItem(DIMENSION_KEY, next); } catch (_) {}
+    if (next === graphDimension && store.graph) return graphDimension;
+    graphDimension = next;
+    if (!store.container || !store.graph) return graphDimension;
+
+    const issues = store.issues;
+    const dependencies = store.dependencies;
+    hideTooltip();
+    destroyGraphInstance();
+    createGraphInstance();
+    store.graph.width(store.container.clientWidth);
+    store.graph.height(store.container.clientHeight);
+    if (issues.length) loadData(issues, dependencies, null);
+    dispatchEvent('dimensionChange', { dimension: graphDimension });
+    return graphDimension;
+}
+
+/**
+ * Zoom by a factor around the current view center (>1 zooms in).
+ */
+export function zoomBy(factor, duration = 300) {
+    if (!store.graph || !(factor > 0)) return;
+    if (!is3D()) {
+        store.graph.zoom(store.graph.zoom() * factor, duration);
+        return;
+    }
+    const cam = store.graph.cameraPosition();
+    // The orbit target, not cameraPosition().lookAt — that is a point a fixed
+    // 1000 units ahead of the camera, so scaling toward it overshoots.
+    const t = store.graph.controls()?.target || cam.lookAt;
+    store.graph.cameraPosition({
+        x: t.x + (cam.x - t.x) / factor,
+        y: t.y + (cam.y - t.y) / factor,
+        z: t.z + (cam.z - t.z) / factor
+    }, { x: t.x, y: t.y, z: t.z }, duration);
+}
+
+// Move the 3D camera to look at (x, y, z) from `distance` away, keeping the
+// current viewing direction. Omitting `distance` keeps the current distance.
+function centerCamera3D(x, y, z, distance, duration) {
+    const cam = store.graph.cameraPosition();
+    const dx = cam.x - x, dy = cam.y - y, dz = cam.z - z;
+    const len = Math.hypot(dx, dy, dz) || 1;
+    const d = distance ?? len;
+    store.graph.cameraPosition(
+        { x: x + dx / len * d, y: y + dy / len * d, z: z + dz / len * d },
+        { x, y, z }, duration);
+}
+
+// '#rrggbb', '#rrggbbaa' or 'hsl(...)' plus an opacity → a CSS color carrying
+// that alpha. The 3D renderer reads per-link opacity from the color's alpha.
+function colorWithAlpha(color, alpha) {
+    const hex = /^#([0-9a-f]{6})([0-9a-f]{2})?$/i.exec(color || '');
+    if (hex) {
+        const n = parseInt(hex[1], 16);
+        const a = alpha * (hex[2] ? parseInt(hex[2], 16) / 255 : 1);
+        return `rgba(${n >> 16}, ${(n >> 8) & 255}, ${n & 255}, ${a.toFixed(3)})`;
+    }
+    const hsl = /^hsl\((.*)\)$/i.exec(color || '');
+    if (hsl) return `hsla(${hsl[1]}, ${alpha})`;
+    return color;
+}
+
+let sphereGeometry3D = null;
+
+// One persistent object per node; update3DNode() restyles it in place, so
+// hover/selection highlighting doesn't rebuild the scene.
+function build3DNode(node) {
+    const THREE = window.THREE;
+    if (!sphereGeometry3D) sphereGeometry3D = new THREE.SphereGeometry(1, 20, 14);
+    const group = new THREE.Group();
+    const mesh = new THREE.Mesh(sphereGeometry3D, new THREE.MeshLambertMaterial());
+    const label = new window.SpriteText('', 4);
+    label.fontFace = "'Inter', -apple-system, sans-serif";
+    label.fontWeight = '500';
+    label.material.depthWrite = false;
+    const titleLabel = new window.SpriteText('', 2.8);
+    titleLabel.fontFace = label.fontFace;
+    titleLabel.fontWeight = '400';
+    titleLabel.material.depthWrite = false;
+    group.add(mesh);
+    group.add(label);
+    group.add(titleLabel);
+    node.__npp3d = { mesh, label, text: null, textColor: null,
+                     titleLabel, titleText: null, titleColor: null };
+    update3DNode(node);
+    return group;
+}
+
+function update3DNode(node) {
+    const o = node.__npp3d;
+    if (!o) return;
+    const size = getNodeSize(node);
+    const color = getNodeColor(node);
+    const opacity = getNodeOpacity(node);
+    const emphasized = store.selectedNode?.id === node.id ||
+                       store.hoveredNode?.id === node.id ||
+                       (store.connectedNodes.size > 0 && store.connectedNodes.has(node.id));
+
+    const material = o.mesh.material;
+    o.mesh.scale.setScalar(size);
+    material.color.set(color);
+    material.emissive.set(emphasized ? color : 0x000000);
+    material.emissiveIntensity = emphasized ? 0.45 : 0;
+    material.opacity = opacity;
+    if (material.transparent !== (opacity < 1)) {
+        material.transparent = opacity < 1;
+        material.depthWrite = opacity >= 1;
+        material.needsUpdate = true;  // transparency changes the render pass
+    }
+
+    let text = node.id;
+    if (store.config.showFireMarks && node.priority <= 1) {
+        text = (node.priority === 0 ? '🔥🔥 ' : '🔥 ') + text;
+    }
+    if (node.inCycle) text += ' ⚠️';
+    // SpriteText redraws its canvas on every property write; skip no-ops.
+    if (o.text !== text) { o.label.text = text; o.text = text; }
+    if (o.textColor !== THEME.fg) { o.label.color = THEME.fg; o.textColor = THEME.fg; }
+    o.label.visible = store.config.showLabels;
+    o.label.material.opacity = opacity * 0.85;
+    o.label.position.y = -(size + 4);
+
+    // Title line under the id (Display panel "Titles").
+    const title = truncate(node.title || '', TITLE_MAX) || '';
+    const showTitle = store.config.showLabels && store.config.showTitles && !!title;
+    if (showTitle && o.titleText !== title) { o.titleLabel.text = title; o.titleText = title; }
+    if (o.titleColor !== THEME.fg) { o.titleLabel.color = THEME.fg; o.titleColor = THEME.fg; }
+    o.titleLabel.visible = showTitle;
+    o.titleLabel.material.opacity = opacity * 0.65;
+    o.titleLabel.position.y = -(size + 4 + 4.2);
+}
+
+function getLinkWidth3D(link) {
+    const srcId = link.source?.id || link.source;
+    const tgtId = link.target?.id || link.target;
+    if (store.highlightedLinks.has(`${srcId}-${tgtId}`)) return 1.6;
+    if (store.connectedNodes.size > 0 && store.connectedNodes.has(srcId) && store.connectedNodes.has(tgtId)) return 1.2;
+    return 0;  // plain line
+}
+
+function refresh3D() {
+    const g = store.graph;
+    if (!g) return;
+    g.graphData().nodes.forEach(update3DNode);
+    // Re-setting an accessor makes the renderer re-evaluate it for every link.
+    g.linkColor(g.linkColor())
+     .linkWidth(g.linkWidth())
+     .linkDirectionalArrowColor(g.linkDirectionalArrowColor());
+}
+
 /**
  * Helper to force ForceGraph to redraw without disturbing the simulation.
  * Uses a micro zoom adjustment trick - imperceptible to users but forces canvas redraw.
@@ -404,6 +618,7 @@ export function setArrowDirection(dir) {
  */
 function refreshGraph() {
     if (!store.graph) return;
+    if (is3D()) { refresh3D(); return; }
     // Get current zoom level
     const currentZoom = store.graph.zoom();
     // Guard against undefined/NaN zoom values
@@ -533,6 +748,7 @@ export function applyTheme(isDark) {
     if (store && store.graph && typeof store.graph.backgroundColor === 'function') {
         store.graph.backgroundColor(THEME.bg);
     }
+    if (store && store.graph && is3D()) refresh3D();
 }
 
 // Surface applyTheme on a well-known global so the native side can
@@ -778,12 +994,22 @@ function buildWasmGraph() {
             store.wasmGraph.free();
             store.wasmGraph = null;
         }
+        if (store.wasmFlowGraph) {
+            store.wasmFlowGraph.free();
+            store.wasmFlowGraph = null;
+        }
 
         store.wasmGraph = DiGraph.withCapacity(store.issues.length, store.dependencies.length);
+        // NppBeads: same nodes with edges blocker → dependent, for whatIfClose.
+        // The engine's what-if follows out-edges to the issues a node
+        // unblocks; on wasmGraph (dependent → blocker) it answered backwards.
+        // Same node order, so indices are interchangeable with wasmGraph.
+        store.wasmFlowGraph = DiGraph.withCapacity(store.issues.length, store.dependencies.length);
 
         // Add all nodes
         store.issues.forEach(issue => {
             store.wasmGraph.addNode(issue.id);
+            store.wasmFlowGraph.addNode(issue.id);
         });
 
         // Add blocking edges
@@ -794,6 +1020,7 @@ function buildWasmGraph() {
                 const toIdx = store.wasmGraph.nodeIdx(d.depends_on_id);
                 if (fromIdx !== undefined && toIdx !== undefined) {
                     store.wasmGraph.addEdge(fromIdx, toIdx);
+                    store.wasmFlowGraph.addEdge(toIdx, fromIdx);
                 }
             });
 
@@ -894,14 +1121,129 @@ export async function initGraph(containerId, options = {}) {
     // Merge config
     Object.assign(store.config, options);
 
-    // Clear container
-    store.container.innerHTML = '';
-
     // Initialize WASM
     await initWasm();
 
-    // Create force-graph instance
-    store.graph = ForceGraph()(store.container)
+    createGraphInstance();
+
+    // Setup keyboard shortcuts
+    setupKeyboardShortcuts();
+
+    // Emit ready event
+    dispatchEvent('ready', { graph: store.graph, wasmReady: store.wasmReady });
+
+    return store.graph;
+}
+
+function createGraphInstance() {
+    store.container.innerHTML = '';
+    if (is3D() && !can3D()) {
+        console.warn('[bv-graph] 3D renderer unavailable (no WebGL or 3D bundle) — using 2D');
+        graphDimension = '2d';
+    }
+    store.graph = is3D() ? create3DGraph() : create2DGraph();
+}
+
+function destroyGraphInstance() {
+    const g = store.graph;
+    if (!g) return;
+    const renderer = is3D() ? g.renderer?.() : null;
+    g._destructor?.();
+    // WebKit caps live WebGL contexts; release this one now rather than at GC.
+    renderer?.dispose();
+    renderer?.forceContextLoss?.();
+    store.graph = null;
+    store.container.innerHTML = '';
+}
+
+// Simulation progress tracking with early "done" detection
+// The simulation can run for a long time at very low alpha values,
+// but the layout is visually stable much earlier. We consider it "done"
+// when alpha drops below 0.05 (95% progress) for smoother UX.
+function handleEngineTick() {
+    // Get current simulation alpha (1 = start, 0 = done)
+    // Alpha decays from 1 towards alphaMin (0.001)
+    const alpha = store.graph.d3Alpha?.() ?? 0;
+    const progress = Math.round((1 - alpha) * 100);
+
+    // Consider layout stable when alpha < 0.05 (95% progress)
+    // This provides a much snappier feel without waiting for full convergence
+    const effectivelyDone = alpha < 0.05;
+    dispatchEvent('simulationProgress', {
+        alpha,
+        progress: effectivelyDone ? 100 : progress,
+        done: effectivelyDone
+    });
+}
+
+function handleEngineStop() {
+    dispatchEvent('simulationProgress', { alpha: 0, progress: 100, done: true });
+}
+
+function create3DGraph() {
+    const g = ForceGraph3D({ controlType: 'orbit' })(store.container)
+        // Data binding
+        .nodeId('id')
+        .linkSource('source')
+        .linkTarget('target')
+
+        // Nodes: sphere + id label, restyled in place by update3DNode().
+        // nodeVal is the sphere volume, so with nodeRelSize 1 the renderer's
+        // radius (cbrt(nodeVal)) matches getNodeSize() and arrowheads land
+        // on the sphere surface.
+        .nodeRelSize(1)
+        .nodeVal(node => Math.pow(getNodeSize(node), 3))
+        .nodeThreeObject(build3DNode)
+        .nodeLabel(() => '')  // showTooltip() handles hover cards
+
+        // Links
+        .linkCurvature(0.2)
+        .linkOpacity(1)
+        .linkColor(link => colorWithAlpha(getLinkColor(link), getLinkOpacity(link)))
+        .linkWidth(getLinkWidth3D)
+        .linkDirectionalArrowLength(6)
+        .linkDirectionalArrowRelPos(1)
+        .linkDirectionalArrowColor(link => getLinkColor(link))
+        .linkDirectionalParticles(() => store.config.enableParticles ? 2 : 0)
+        .linkDirectionalParticleSpeed(store.config.particleSpeed)
+        .linkDirectionalParticleWidth(1.5)
+        .linkDirectionalParticleColor(() => THEME.accent.cyan)
+
+        // Warmup
+        .warmupTicks(store.config.warmupTicks)
+        .cooldownTicks(store.config.cooldownTicks)
+
+        // Interaction handlers (no onZoom: the 3D camera has no zoom transform)
+        .onNodeClick(handleNodeClick)
+        .onNodeRightClick(handleNodeRightClick)
+        .onNodeHover(handleNodeHover)
+        .onNodeDrag(handleNodeDrag)
+        .onNodeDragEnd(handleNodeDragEnd)
+        .onLinkClick(handleLinkClick)
+        .onLinkHover(handleLinkHover)
+        .onBackgroundClick(handleBackgroundClick)
+        .onEngineTick(handleEngineTick)
+        .onEngineStop(handleEngineStop)
+
+        .backgroundColor(THEME.bg)
+        .showNavInfo(false);
+
+    // Same tuning as 2D, applied to the renderer's built-in 3D forces.
+    g.d3Force('charge')
+        .strength(store.config.chargeStrength)
+        .distanceMax(300);
+    g.d3Force('link')
+        .distance(link => getLinkDistance(link))
+        .strength(0.7);
+    g.d3Force('x', F().forceX().strength(store.config.centerStrength))
+     .d3Force('y', F().forceY().strength(store.config.centerStrength))
+     .d3Force('z', F().forceZ().strength(store.config.centerStrength))
+     .d3Force('collision', F().forceCollide().radius(node => getNodeSize(node) + 5));
+    return g;
+}
+
+function create2DGraph() {
+    return ForceGraph()(store.container)
         // Data binding
         .nodeId('id')
         .linkSource('source')
@@ -920,18 +1262,18 @@ export async function initGraph(containerId, options = {}) {
         .linkDirectionalParticleColor(() => THEME.accent.cyan)
 
         // Forces
-        .d3Force('charge', d3.forceManyBody()
+        .d3Force('charge', F().forceManyBody()
             .strength(store.config.chargeStrength)
             .distanceMax(300))
-        .d3Force('link', d3.forceLink()
+        .d3Force('link', F().forceLink()
             .distance(link => getLinkDistance(link))
             .strength(0.7))
-        .d3Force('center', d3.forceCenter())
-        .d3Force('x', d3.forceX()
+        .d3Force('center', F().forceCenter())
+        .d3Force('x', F().forceX()
             .strength(store.config.centerStrength))
-        .d3Force('y', d3.forceY()
+        .d3Force('y', F().forceY()
             .strength(store.config.centerStrength))
-        .d3Force('collision', d3.forceCollide()
+        .d3Force('collision', F().forceCollide()
             .radius(node => getNodeSize(node) + 5))
 
         // Warmup
@@ -948,29 +1290,8 @@ export async function initGraph(containerId, options = {}) {
         .onLinkHover(handleLinkHover)
         .onBackgroundClick(handleBackgroundClick)
         .onZoom(handleZoom)
-
-        // Simulation progress tracking with early "done" detection
-        // The simulation can run for a long time at very low alpha values,
-        // but the layout is visually stable much earlier. We consider it "done"
-        // when alpha drops below 0.05 (95% progress) for smoother UX.
-        .onEngineTick(() => {
-            // Get current simulation alpha (1 = start, 0 = done)
-            // Alpha decays from 1 towards alphaMin (0.001)
-            const alpha = store.graph.d3Alpha?.() ?? 0;
-            const progress = Math.round((1 - alpha) * 100);
-
-            // Consider layout stable when alpha < 0.05 (95% progress)
-            // This provides a much snappier feel without waiting for full convergence
-            const effectivelyDone = alpha < 0.05;
-            dispatchEvent('simulationProgress', {
-                alpha,
-                progress: effectivelyDone ? 100 : progress,
-                done: effectivelyDone
-            });
-        })
-        .onEngineStop(() => {
-            dispatchEvent('simulationProgress', { alpha: 0, progress: 100, done: true });
-        })
+        .onEngineTick(handleEngineTick)
+        .onEngineStop(handleEngineStop)
 
         // Background
         .backgroundColor(THEME.bg)
@@ -981,14 +1302,6 @@ export async function initGraph(containerId, options = {}) {
                 drawClusterHulls(ctx, globalScale);
             }
         });
-
-    // Setup keyboard shortcuts
-    setupKeyboardShortcuts();
-
-    // Emit ready event
-    dispatchEvent('ready', { graph: store.graph, wasmReady: store.wasmReady });
-
-    return store.graph;
 }
 
 // ============================================================================
@@ -1105,6 +1418,9 @@ function prepareGraphData(layout = null) {
         // NppBeads isolation (Find-node) — overrides everything else.
         if (store.isolateNodes && !store.isolateNodes.has(issue.id)) return false;
 
+        // NppBeads facet filters (top bar).
+        if (store.facetPredicate && !store.facetPredicate(issue)) return false;
+
         // Status filter
         if (filters.status && issue.status !== filters.status) return false;
         if (!filters.showClosed && issue.status === 'closed') return false;
@@ -1137,15 +1453,20 @@ function prepareGraphData(layout = null) {
     //   'execution'  → prereq → dependent (flow convention, default)
     //   'dependency' → dependent → prereq (build-system convention)
     // See the arrowDirection block near the top of the module.
+    //   'epic'       → parent → child over the parent-child hierarchy
     const execFlow = (arrowDirection === 'execution');
-    let links = dependencies
-        .filter(d => (d.type === 'blocks' || !d.type))
-        .filter(d => nodeIds.has(d.issue_id) && nodeIds.has(d.depends_on_id))
-        .map(d => ({
-            source: execFlow ? d.depends_on_id : d.issue_id,
-            target: execFlow ? d.issue_id      : d.depends_on_id,
-            type:   d.type || 'blocks'
-        }));
+    let links = arrowDirection === 'epic'
+        ? store.hierarchy
+            .filter(d => nodeIds.has(d.issue_id) && nodeIds.has(d.depends_on_id))
+            .map(d => ({ source: d.depends_on_id, target: d.issue_id, type: 'parent-child' }))
+        : dependencies
+            .filter(d => (d.type === 'blocks' || !d.type))
+            .filter(d => nodeIds.has(d.issue_id) && nodeIds.has(d.depends_on_id))
+            .map(d => ({
+                source: execFlow ? d.depends_on_id : d.issue_id,
+                target: execFlow ? d.issue_id      : d.depends_on_id,
+                type:   d.type || 'blocks'
+            }));
 
     // Enrich nodes with computed data
     nodes = nodes.map(issue => {
@@ -1369,14 +1690,16 @@ function drawNode(node, ctx, globalScale) {
         ctx.fillStyle = THEME.fg;
         ctx.globalAlpha = opacity * 0.85;
 
-        // Show title when zoomed in enough for it to be readable
-        let label = node.id;
-        if (globalScale > 1.5) {
-            label = truncate(node.title || node.id, 30);
-        } else if (globalScale > 1.0) {
-            label = truncate(node.title || node.id, 20);
+        // NppBeads: the id is always the label (it used to give way to a
+        // short title when zoomed in); the Display panel's "Titles" adds the
+        // title as a second line under it.
+        ctx.fillText(node.id, node.x, node.y + size + 3);
+        if (store.config.showTitles && node.title) {
+            const titleSize = fontSize * 0.85;
+            ctx.font = `400 ${titleSize}px 'Inter', 'JetBrains Mono', sans-serif`;
+            ctx.globalAlpha = opacity * 0.65;
+            ctx.fillText(truncate(node.title, TITLE_MAX), node.x, node.y + size + 3 + fontSize * 1.2);
         }
-        ctx.fillText(label, node.x, node.y + size + 3);
     }
 
     ctx.restore();
@@ -1710,6 +2033,7 @@ function handleNodeDragEnd(node) {
     // Fix position after drag
     node.fx = node.x;
     node.fy = node.y;
+    if (is3D()) node.fz = node.z;
     dispatchEvent('nodeDragEnd', { node });
 }
 
@@ -1768,7 +2092,7 @@ export function performWhatIf(node) {
     // Call WASM what-if
     let result;
     try {
-        result = store.wasmGraph.whatIfClose(idx, closedSet);
+        result = store.wasmFlowGraph.whatIfClose(idx, closedSet);
         if (typeof result === 'string') {
             result = JSON.parse(result);
         }
@@ -2432,8 +2756,14 @@ export function zoomToCycle(index = cycleNavigatorState.currentIndex) {
     const scaleY = containerHeight / height;
     const scale = Math.min(scaleX, scaleY, 2.5); // Cap at 2.5x zoom
 
-    store.graph.centerAt(centerX, centerY, 400);
-    store.graph.zoom(scale, 400);
+    if (is3D()) {
+        const zs = cycleNodes.map(n => n.z || 0);
+        const centerZ = (Math.min(...zs) + Math.max(...zs)) / 2;
+        centerCamera3D(centerX, centerY, centerZ, Math.max(width, height) * 1.2 + 60, 400);
+    } else {
+        store.graph.centerAt(centerX, centerY, 400);
+        store.graph.zoom(scale, 400);
+    }
 
     dispatchEvent('cycleZoom', { index, cycle, center: { x: centerX, y: centerY }, scale });
 }
@@ -2531,6 +2861,7 @@ export function search(term) {
 // matches PLUS their 1-level direct neighbors (both directions). Pass an
 // empty/nullish term to clear isolation and re-show everything.
 export function searchAndIsolate(term) {
+    store.isolateTerm = (term && term.trim()) ? term : null;
     if (!term || !term.trim()) {
         store.isolateNodes = null;
         const graphData = prepareGraphData();
@@ -2563,7 +2894,160 @@ export function searchAndIsolate(term) {
     const graphData = prepareGraphData();
     store.graph.graphData(graphData);
     dispatchEvent('isolateChange', { count: keep.size, matches: matchIds.size });
-    return { matches: matchIds.size, visible: graphData.nodes.length };
+    return { matches: matchIds.size, visible: graphData.nodes.length, ids: [...matchIds] };
+}
+
+// NppBeads: facet filters from the graph's top bar. `predicate` decides
+// per issue; null clears. Combines with Find-node isolation (both apply).
+export function setFacetPredicate(predicate) {
+    store.facetPredicate = typeof predicate === 'function' ? predicate : null;
+    if (!store.graph) return null;
+    const graphData = prepareGraphData();
+    store.graph.graphData(graphData);
+    dispatchEvent('filterChange', { filters: { ...store.filters } });
+    return { visible: graphData.nodes.length };
+}
+
+// NppBeads: open `blocks` neighbours of an issue, as `bd ready` counts them:
+// blockers = prerequisites that aren't closed, blocking = dependents that
+// aren't closed. Indexed once per loaded data set.
+let blockIndex = null;
+let blockIndexFor = null;
+export function getBlockingState(id) {
+    if (blockIndexFor !== store.dependencies) {
+        blockIndex = new Map();
+        const entry = (k) => {
+            let e = blockIndex.get(k);
+            if (!e) { e = { up: new Set(), down: new Set() }; blockIndex.set(k, e); }
+            return e;
+        };
+        for (const d of store.dependencies) {
+            if (d.type && d.type !== 'blocks') continue;
+            if (!d.issue_id || !d.depends_on_id || d.issue_id === d.depends_on_id) continue;
+            entry(d.issue_id).up.add(d.depends_on_id);
+            entry(d.depends_on_id).down.add(d.issue_id);
+        }
+        blockIndexFor = store.dependencies;
+    }
+    const e = blockIndex.get(id);
+    if (!e) return { blockers: 0, blocking: 0 };
+    const live = (other) => {
+        const o = store.nodeMap.get(other);
+        return !!o && o.status !== 'closed';
+    };
+    let blockers = 0, blocking = 0;
+    for (const o of e.up)   if (live(o)) blockers++;
+    for (const o of e.down) if (live(o)) blocking++;
+    return { blockers, blocking };
+}
+
+export function getIssues() {
+    return store.issues;
+}
+
+// NppBeads: live refresh — bd wrote while the graph was on screen. Like
+// loadData(), but keeps what the user is looking at: issues that still
+// exist keep their positions (a status change just recolours the node),
+// and the camera, selection, Find-node isolation and facet filters stay.
+// Returns the same shape as searchAndIsolate() for the toolbar summary.
+export function refreshData(issues, dependencies, hierarchy) {
+    if (!store.graph) return null;
+    const carry = new Map();
+    for (const n of (store.graph.graphData().nodes || [])) carry.set(n.id, n);
+
+    setHierarchy(hierarchy);
+    store.issues = issues;
+    store.dependencies = dependencies;
+    store.nodeMap.clear();
+    store.nodeIndexMap.clear();
+    issues.forEach((issue, idx) => {
+        store.nodeMap.set(issue.id, issue);
+        store.nodeIndexMap.set(issue.id, idx);
+    });
+    if (store.wasmReady) {
+        buildWasmGraph();
+        computeMetrics();
+    }
+    buildLabelColorMap();
+
+    // Re-run the Find-node isolation on the new data (titles may have
+    // changed, issues may have come or gone).
+    let matches = 0, ids = [];
+    if (store.isolateTerm) {
+        const q = store.isolateTerm.toLowerCase().trim();
+        const matchIds = new Set();
+        for (const issue of store.issues) {
+            const hay = (issue.id + ' ' + (issue.title || '') +
+                         ' ' + (issue.description || '')).toLowerCase();
+            if (hay.includes(q)) matchIds.add(issue.id);
+        }
+        const keep = new Set(matchIds);
+        for (const d of store.dependencies) {
+            if (matchIds.has(d.issue_id))      keep.add(d.depends_on_id);
+            if (matchIds.has(d.depends_on_id)) keep.add(d.issue_id);
+        }
+        store.isolateNodes = keep;
+        matches = matchIds.size;
+        ids = [...matchIds];
+    }
+
+    const graphData = prepareGraphData();
+    for (const n of graphData.nodes) {
+        const o = carry.get(n.id);
+        if (!o) continue;
+        for (const k of ['x', 'y', 'z', 'vx', 'vy', 'vz']) {
+            if (typeof o[k] === 'number') n[k] = o[k];
+        }
+        if (o.fx != null) n.fx = o.fx;
+        if (o.fy != null) n.fy = o.fy;
+        if (o.fz != null) n.fz = o.fz;
+    }
+    if (store.selectedNode) {
+        store.selectedNode = graphData.nodes.find(n => n.id === store.selectedNode.id) || null;
+    }
+    store.hoveredNode = null;
+    store.graph.graphData(graphData);
+    computeMaxMetrics();
+    if (is3D()) refresh3D(); else refreshGraph();
+    dispatchEvent('dataRefreshed', {
+        nodeCount: graphData.nodes.length,
+        linkCount: graphData.links.length,
+    });
+    return { matches, visible: graphData.nodes.length, ids };
+}
+
+// NppBeads: the parent-child hierarchy (Epic Flow + the Epic filter). Call
+// before loadData() so the first render can use it.
+export function setHierarchy(edges) {
+    store.hierarchy = (edges || []).filter(d =>
+        d && d.issue_id && d.depends_on_id && d.issue_id !== d.depends_on_id);
+}
+
+// NppBeads: the epics an issue belongs to — itself if it is an epic, plus
+// every epic up its parent chain(s). Cycle-safe; indexed once per data set.
+let parentsOf = null;
+let parentsFor = null;
+export function getEpicsOf(id) {
+    if (parentsFor !== store.hierarchy) {
+        parentsOf = new Map();
+        for (const d of store.hierarchy) {
+            if (!parentsOf.has(d.issue_id)) parentsOf.set(d.issue_id, []);
+            parentsOf.get(d.issue_id).push(d.depends_on_id);
+        }
+        parentsFor = store.hierarchy;
+    }
+    const epics = [];
+    const seen = new Set();
+    const queue = [id];
+    while (queue.length) {
+        const cur = queue.shift();
+        if (seen.has(cur)) continue;
+        seen.add(cur);
+        const issue = store.nodeMap.get(cur);
+        if (issue && issue.type === 'epic') epics.push(cur);
+        for (const p of (parentsOf.get(cur) || [])) queue.push(p);
+    }
+    return epics;
 }
 
 // NppBeads: runtime toggles for visual features. Both cause a graph
@@ -2572,6 +3056,15 @@ export function setFireMarksEnabled(enabled) {
     store.config.showFireMarks = !!enabled;
     if (store.graph) refreshGraph();
 }
+
+// NppBeads: issue titles under the id labels (2D and 3D). Remembered.
+export function setTitlesEnabled(enabled) {
+    store.config.showTitles = !!enabled;
+    try { localStorage.setItem(TITLES_KEY, store.config.showTitles ? 'true' : 'false'); } catch (_) {}
+    if (!store.graph) return;
+    if (is3D()) refresh3D(); else refreshGraph();
+}
+export function getTitlesEnabled() { return store.config.showTitles; }
 
 export function setParticlesEnabled(enabled) {
     store.config.enableParticles = !!enabled;
@@ -2595,8 +3088,12 @@ export function focusNode(nodeId, zoom = 2) {
     const graphData = store.graph.graphData();
     const node = graphData.nodes.find(n => n.id === nodeId);
     if (node) {
-        store.graph.centerAt(node.x, node.y, 500);
-        store.graph.zoom(zoom, 500);
+        if (is3D()) {
+            centerCamera3D(node.x, node.y, node.z || 0, 240 / zoom, 500);
+        } else {
+            store.graph.centerAt(node.x, node.y, 500);
+            store.graph.zoom(zoom, 500);
+        }
         selectNode(node);
     }
 }
@@ -2608,8 +3105,12 @@ export function zoomToFit(padding = 50) {
 export function resetView() {
     clearSelection();
     clearFilters();
-    store.graph.centerAt(0, 0, 500);
-    store.graph.zoom(1, 500);
+    if (is3D()) {
+        store.graph.zoomToFit(500, 50);
+    } else {
+        store.graph.centerAt(0, 0, 500);
+        store.graph.zoom(1, 500);
+    }
 }
 
 export function setViewMode(mode) {
@@ -2656,16 +3157,16 @@ function applyForceLayout() {
     store.graph
         .d3Force('x', null)
         .d3Force('y', null)
-        .d3Force('charge', d3.forceManyBody().strength(store.config.chargeStrength))
+        .d3Force('charge', F().forceManyBody().strength(store.config.chargeStrength))
         .d3ReheatSimulation();
 }
 
 function applyHierarchyLayout() {
     // Top-down hierarchy based on critical path depth
     store.graph
-        .d3Force('x', d3.forceX(0).strength(0.1))
-        .d3Force('y', d3.forceY(node => (node.criticalDepth || 0) * 100).strength(0.3))
-        .d3Force('charge', d3.forceManyBody().strength(-50))
+        .d3Force('x', F().forceX(0).strength(0.1))
+        .d3Force('y', F().forceY(node => (node.criticalDepth || 0) * 100).strength(0.3))
+        .d3Force('charge', F().forceManyBody().strength(-50))
         .d3ReheatSimulation();
 }
 
@@ -2673,9 +3174,9 @@ function applyRadialLayout() {
     // Radial layout from selected node or center
     const center = store.selectedNode || { x: 0, y: 0 };
     store.graph
-        .d3Force('x', d3.forceX(center.x).strength(0.05))
-        .d3Force('y', d3.forceY(center.y).strength(0.05))
-        .d3Force('radial', d3.forceRadial(
+        .d3Force('x', F().forceX(center.x).strength(0.05))
+        .d3Force('y', F().forceY(center.y).strength(0.05))
+        .d3Force('radial', F().forceRadial(
             node => (node.criticalDepth || 0) * 80,
             center.x,
             center.y
@@ -2693,9 +3194,9 @@ function applyClusterLayout() {
     };
 
     store.graph
-        .d3Force('x', d3.forceX(node => statusPositions[node.status]?.x || 0).strength(0.3))
-        .d3Force('y', d3.forceY(node => statusPositions[node.status]?.y || 0).strength(0.3))
-        .d3Force('charge', d3.forceManyBody().strength(-30))
+        .d3Force('x', F().forceX(node => statusPositions[node.status]?.x || 0).strength(0.3))
+        .d3Force('y', F().forceY(node => statusPositions[node.status]?.y || 0).strength(0.3))
+        .d3Force('charge', F().forceManyBody().strength(-30))
         .d3ReheatSimulation();
 }
 
@@ -2713,18 +3214,18 @@ function applyLabelGalaxyLayout() {
 
     // Apply forces to pull nodes toward their label's center
     store.graph
-        .d3Force('x', d3.forceX(node => {
+        .d3Force('x', F().forceX(node => {
             const label = getPrimaryLabel(node);
             const center = labelClusterState.labelCenters.get(label);
             return center ? center.x : 0;
         }).strength(0.4))
-        .d3Force('y', d3.forceY(node => {
+        .d3Force('y', F().forceY(node => {
             const label = getPrimaryLabel(node);
             const center = labelClusterState.labelCenters.get(label);
             return center ? center.y : 0;
         }).strength(0.4))
-        .d3Force('charge', d3.forceManyBody().strength(-40))
-        .d3Force('collision', d3.forceCollide().radius(node => getNodeSize(node) + 8))
+        .d3Force('charge', F().forceManyBody().strength(-40))
+        .d3Force('collision', F().forceCollide().radius(node => getNodeSize(node) + 8))
         .d3ReheatSimulation();
 
     // Show label legend
@@ -2776,15 +3277,15 @@ function applyPreset(presetName) {
     } else {
         // Reset to standard force configuration
         store.graph
-            .d3Force('link', d3.forceLink()
+            .d3Force('link', F().forceLink()
                 .id(d => d.id)
                 .distance(getLinkDistance))
-            .d3Force('charge', d3.forceManyBody()
+            .d3Force('charge', F().forceManyBody()
                 .strength(store.config.chargeStrength))
-            .d3Force('center', d3.forceCenter())
-            .d3Force('x', d3.forceX()
+            .d3Force('center', F().forceCenter())
+            .d3Force('x', F().forceX()
                 .strength(store.config.centerStrength))
-            .d3Force('y', d3.forceY()
+            .d3Force('y', F().forceY()
                 .strength(store.config.centerStrength))
             .warmupTicks(store.config.warmupTicks)
             .cooldownTicks(store.config.cooldownTicks)
@@ -2805,24 +3306,24 @@ function applyCustomForces(customForces) {
         const gridStrength = customForces.gridStrength;
 
         store.graph
-            .d3Force('x', d3.forceX(node => {
+            .d3Force('x', F().forceX(node => {
                 // Snap to nearest grid column
                 return Math.round(node.x / gridSize) * gridSize;
             }).strength(gridStrength))
-            .d3Force('y', d3.forceY(node => {
+            .d3Force('y', F().forceY(node => {
                 // Snap to nearest grid row, with depth offset
                 const depth = node.criticalDepth || 0;
                 return depth * gridSize + Math.round(node.y / gridSize) * gridSize;
             }).strength(gridStrength))
-            .d3Force('charge', d3.forceManyBody().strength(store.config.chargeStrength))
+            .d3Force('charge', F().forceManyBody().strength(store.config.chargeStrength))
             .d3ReheatSimulation();
     } else if (customForces.yStrength && customForces.depthSpacing) {
         // Compact DAG: emphasize vertical hierarchy
         store.graph
-            .d3Force('x', d3.forceX(0).strength(0.15))
-            .d3Force('y', d3.forceY(node => (node.criticalDepth || 0) * customForces.depthSpacing)
+            .d3Force('x', F().forceX(0).strength(0.15))
+            .d3Force('y', F().forceY(node => (node.criticalDepth || 0) * customForces.depthSpacing)
                 .strength(customForces.yStrength))
-            .d3Force('charge', d3.forceManyBody().strength(store.config.chargeStrength))
+            .d3Force('charge', F().forceManyBody().strength(store.config.chargeStrength))
             .d3ReheatSimulation();
     }
 }
@@ -3063,7 +3564,8 @@ function selectAndCenterNode(node) {
 
     // Center and zoom to the node
     if (typeof node.x === 'number' && typeof node.y === 'number') {
-        store.graph.centerAt(node.x, node.y, 500);
+        if (is3D()) centerCamera3D(node.x, node.y, node.z || 0, undefined, 500);
+        else store.graph.centerAt(node.x, node.y, 500);
     }
 
     // Refresh display
@@ -3148,7 +3650,10 @@ function showTooltip(node) {
         <div style="margin-bottom: 8px; line-height: 1.4;">
             ${escapeHtml(node.title)}
         </div>
-        <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px;">
+        <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 8px;">
+            <span title="Issue type" style="border: 1px solid ${THEME.fgMuted}; color: ${THEME.fg}; padding: 1px 7px; border-radius: 4px; font-size: 10px; text-transform: uppercase;">
+                ${escapeHtml(node.type || 'task')}
+            </span>
             <span style="background: ${statusColor}; color: ${THEME.bg}; padding: 2px 8px; border-radius: 4px; font-size: 10px; text-transform: uppercase;">
                 ${node.status}
             </span>
@@ -3433,6 +3938,10 @@ export function cleanup() {
     if (store.wasmGraph) {
         store.wasmGraph.free();
         store.wasmGraph = null;
+    }
+    if (store.wasmFlowGraph) {
+        store.wasmFlowGraph.free();
+        store.wasmFlowGraph = null;
     }
     if (store.animationFrame) {
         cancelAnimationFrame(store.animationFrame);

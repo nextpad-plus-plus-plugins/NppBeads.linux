@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(NppBeads VERSION 0.9.3 LANGUAGES CXX)
+project(NppBeads VERSION 1.0.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,6 +23,7 @@ add_library(beads_core STATIC
     src/BeadsProjectScanner.cpp
     src/BeadsWatcher.cpp
     src/BeadsPoll.cpp
+    src/BdEventsTail.cpp
     src/BeadsRecent.cpp)
 target_include_directories(beads_core PUBLIC src "${NPP_LINUX_DIR}/src"
     "${NPP_LINUX_DIR}/scintilla/include")

@@ -16,7 +16,7 @@
 
   if (window.__nppBeads) return;
   const NPP = window.__nppBeads = {
-    version: 17,  // bump on every bridge.js edit to confirm the page
+    version: 18,  // bump on every bridge.js edit to confirm the page
                   // picked up the latest file (stale WebKit cache check).
     mode: 'jsonl',
     // Prefer the synchronously-preloaded JSONL (injected by BeadsPanel
@@ -85,10 +85,24 @@
     return false;
   }
 
+  // Native pushes JSONL here twice over a page's life: to answer the
+  // init-time requestJsonl() (pending resolvers), and after every data
+  // change / page load (BeadsPanel _pushJsonlToWebview, _pushJsonlToBridge).
+  // A push that changes the text after init used to be dropped, so the
+  // Dashboard / Insights / Graph kept showing the data they loaded with.
+  // Now it drops the cached DB and fires 'npp-beads:jsonl-reloaded' for
+  // the page to refresh itself (viewer.js, app/app.js).
   NPP.receiveJsonl = function (text) {
-    NPP.jsonl = text || '';
+    const next = text || '';
+    const changed = NPP.jsonl !== null && next !== NPP.jsonl;
+    NPP.jsonl = next;
+    window.__nppBeadsPreloadedJsonl = next;
     const queued = NPP.pendingJsonlResolvers.splice(0);
     queued.forEach((resolve) => resolve(NPP.jsonl));
+    if (changed && !queued.length) {
+      NPP.dbBytesPromise = null;
+      try { window.dispatchEvent(new Event('npp-beads:jsonl-reloaded')); } catch {}
+    }
   };
   NPP.receiveError = function (msg) {
     NPP.err('native error:', msg);
@@ -110,6 +124,9 @@
   }
 
   // ── JSONL parser (robust against partial-line truncation) ────────────
+  // Keeps issue records only: bd 1.3 exports also carry other record kinds
+  // (`"_type":"memory"` — key/value notes, no id) that must not become
+  // phantom issues in the dashboard counts and the graph.
   function parseJsonl(text) {
     const out = [];
     if (!text) return out;
@@ -117,8 +134,12 @@
     for (let i = 0; i < lines.length; i++) {
       const raw = lines[i].trim();
       if (!raw) continue;
-      try { out.push(JSON.parse(raw)); }
-      catch (e) { NPP.warn(`line ${i + 1} JSON parse failed:`, e.message); }
+      let rec;
+      try { rec = JSON.parse(raw); }
+      catch (e) { NPP.warn(`line ${i + 1} JSON parse failed:`, e.message); continue; }
+      if (!rec || typeof rec !== 'object' || !rec.id) continue;
+      if (rec._type && rec._type !== 'issue') continue;
+      out.push(rec);
     }
     return out;
   }
@@ -646,26 +667,18 @@
   }
 
   // Called by BeadsPanel._pushSearchQuery when the toolbar search is
-  // typed in while on the Rich Issues view. Sets searchQuery on the
-  // Alpine beadsApp root and triggers loadIssues(). Diagnostic log
-  // lets us trace via ctxCopyDiagnostics' __nppConsoleTail whether the
-  // bridge actually reached this function (helpful when Issues search
-  // appears to do nothing).
-  window.__nppRichSearch = function (q) {
+  // typed in while on the Graph view: Find-node (isolate matches plus
+  // their direct neighbours). Before Alpine or the graph is up, the query
+  // is parked and picked up once the graph has loaded its data.
+  window.__nppGraphSearch = function (q) {
     const query = (q || '').trim();
     const app = richApp();
-    if (!app) {
-      NPP.warn('__nppRichSearch called but Alpine root not ready; q="' + query + '"');
+    if (!app || typeof app.applyGraphFilters !== 'function') {
+      window.__nppGraphPendingQuery = query;
       return false;
     }
-    NPP.log('__nppRichSearch q="' + query + '" (view=' + (app.view || '?') +
-            ', hasLoad=' + (typeof app.loadIssues === 'function') + ')');
-    app.searchQuery = query;
-    app.page = 1;
-    if (typeof app.loadIssues === 'function') {
-      try { app.loadIssues(); }
-      catch (e) { NPP.warn('loadIssues failed:', e && e.message); }
-    }
+    app.graphQuery = query;
+    app.applyGraphFilters();
     return true;
   };
 

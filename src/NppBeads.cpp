@@ -335,6 +335,28 @@ extern "C" NPP_EXPORT void beNotified(SCNotification *n) {
                 npp(NPPM_ADDTOOLBARICON_FORDARKMODE,
                     (unsigned long)sFuncItem[kCmdShowPanel].cmdID, (long)(intptr_t)icon.c_str());
             }
+            // Resolve the bead-id indicator slot (macOS fbf18c8, adapted).
+            // The shipped default 25 is Mark style 5 on this host (main.c
+            // NPP_MARK_INDIC_BASE 21 → marks own 21-25), so painting there
+            // would tint and clear Mark-5 ranges. Ask NPPM_ALLOCATEINDICATOR
+            // for a slot; the Linux allocator pool starts at 9 and overlaps
+            // host-owned slots (9 = incremental search, 19 = link), so
+            // validate the answer against the known-owned set and fall back
+            // to 18 — the top of the 10-18 band nothing on this host paints.
+            static bool slotDone = false;
+            if (!slotDone && sIndicator) {
+                slotDone = true;
+                auto hostOwned = [](int s) {
+                    return s == 8 || s == 9 || s == 19 ||
+                           (s >= 21 && s <= 25) || s == 28 || s == 31;
+                };
+                int slot = -1;
+                if (!npp(NPPM_ALLOCATEINDICATOR, 1, (long)(intptr_t)&slot) ||
+                    slot <= 0 || hostOwned(slot))
+                    slot = 18;
+                sIndicator->setIndicatorSlot(slot);
+                g_message("[NppBeads] bead-id indicator slot %d", slot);
+            }
             break;
         }
         case NPPN_BUFFERACTIVATED:

@@ -34,6 +34,13 @@ public:
     void setScintillaHandle(void *h);
     void *scintillaHandle() const { return handle_; }
 
+    // Scintilla indicator slot to paint on. Defaults to 25 (macOS-legacy
+    // parity) but the Linux host owns 21-25 as Mark styles 1-5, so
+    // NppBeads.cpp resolves a collision-free slot at NPPN_READY and sets it
+    // here before any paint. Changing the slot restyles on the next paint.
+    void setIndicatorSlot(int slot);
+    int indicatorSlot() const { return indicatorSlot_; }
+
     void scheduleRescan();     // 150 ms debounce, coalesced
     void rescanNow();
     void clearAll();
@@ -53,6 +60,7 @@ private:
     void *handle_ = nullptr;
     std::string prefix_ = "bd-";
     std::vector<BeadIdMatch> cache_;
+    int indicatorSlot_;
     bool stylesInstalled_ = false;
     guint debounceSrc_ = 0;
 };

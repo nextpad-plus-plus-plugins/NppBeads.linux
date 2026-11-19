@@ -18,24 +18,34 @@
 #define SCI_GETLINECOUNT        2154
 #define SCI_POSITIONFROMLINE    2167
 #define SCI_SETSEARCHFLAGS      2198
-#define SCI_SETTARGETRANGE      2643
-#define SCI_GETTARGETSTART      2644
-#define SCI_GETTARGETEND        2645
+#define SCI_SETTARGETRANGE      2686
+#define SCI_GETTARGETSTART      2191   // after search: start of match (byte)
+#define SCI_GETTARGETEND        2193   // end (byte, exclusive)
 #define SCI_SEARCHINTARGET      2197
 #define SCI_DOCLINEFROMVISIBLE  2221
 #define SCI_GETCHARAT           2007
 
 #define INDIC_TEXTFORE          17
 #define SCFIND_REGEXP           0x00200000
-#define SCFIND_CXX11REGEX       0x00400000
+#define SCFIND_CXX11REGEX       0x00800000
 
-// Indicator slot. Host uses 9-13 (Mark styles) and 28 (inc-search); 25 is
-// clear. Plugin convention is 20-30.
-static const int kBeadIndicator = 25;
+// Default indicator slot (macOS-legacy parity). On THIS host it is NOT free —
+// the Linux host paints Mark styles 1-5 on indicators 21-25 (main.c
+// NPP_MARK_INDIC_BASE 21) — so NppBeads.cpp resolves a collision-free slot at
+// NPPN_READY (NPPM_ALLOCATEINDICATOR, validated, fallback 18) and overrides
+// via setIndicatorSlot() before any paint.
+static const int kBeadIndicatorDefault = 25;
 // Link color. Scintilla color is 0x00BBGGRR. #2563eb → BGR 0xEB6325.
 static const int kBeadLinkColor = 0xEB6325;
 
-BeadIdIndicator::BeadIdIndicator(BeadIdSendMessageFn send) : send_(send) {}
+BeadIdIndicator::BeadIdIndicator(BeadIdSendMessageFn send)
+    : send_(send), indicatorSlot_(kBeadIndicatorDefault) {}
+
+void BeadIdIndicator::setIndicatorSlot(int slot) {
+    if (indicatorSlot_ == slot) return;
+    indicatorSlot_ = slot;
+    stylesInstalled_ = false;   // style the new slot on next paint
+}
 BeadIdIndicator::~BeadIdIndicator() {
     if (debounceSrc_) g_source_remove(debounceSrc_);
 }
@@ -72,8 +82,8 @@ void BeadIdIndicator::scheduleRescan() {
 
 void BeadIdIndicator::installStylesIfNeeded() {
     if (stylesInstalled_ || !handle_) return;
-    send(SCI_INDICSETSTYLE, (uintptr_t)kBeadIndicator, INDIC_TEXTFORE);
-    send(SCI_INDICSETFORE,  (uintptr_t)kBeadIndicator, (intptr_t)kBeadLinkColor);
+    send(SCI_INDICSETSTYLE, (uintptr_t)indicatorSlot_, INDIC_TEXTFORE);
+    send(SCI_INDICSETFORE,  (uintptr_t)indicatorSlot_, (intptr_t)kBeadLinkColor);
     stylesInstalled_ = true;
 }
 
@@ -107,7 +117,7 @@ void BeadIdIndicator::rescanNow() {
     if (endByte < startByte) endByte = startByte;
 
     // Clear only the scan window (persistent-across-scroll, no flicker).
-    send(SCI_SETINDICATORCURRENT, (uintptr_t)kBeadIndicator);
+    send(SCI_SETINDICATORCURRENT, (uintptr_t)indicatorSlot_);
     send(SCI_INDICATORCLEARRANGE, (uintptr_t)startByte, (intptr_t)(endByte - startByte));
 
     std::vector<BeadIdMatch> matches;
@@ -146,7 +156,7 @@ void BeadIdIndicator::clearAll() {
     if (!handle_) return;
     installStylesIfNeeded();
     intptr_t len = send(SCI_GETLENGTH);
-    send(SCI_SETINDICATORCURRENT, (uintptr_t)kBeadIndicator);
+    send(SCI_SETINDICATORCURRENT, (uintptr_t)indicatorSlot_);
     send(SCI_INDICATORCLEARRANGE, 0, len);
     cache_.clear();
 }

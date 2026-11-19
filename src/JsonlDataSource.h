@@ -17,6 +17,16 @@ public:
     std::string rawText();                        // raw JSONL (cached)
     JsonArray *issues();                          // parsed rows (borrowed; owned by this)
     void reload();                                // force reread next accessor
+                                                  // (no-op while fedExternally)
+
+    // Data-source priority support (macOS 20c5103): when the panel renders
+    // from the Dolt DB (`bd export` to stdout), it feeds the fresh JSONL text
+    // here so every consumer (raw preload, counts) stays on one code path.
+    // While fedExternally is true, reload()/invalidateCache() do NOT reread
+    // the file — the adopted text wins until the flag is cleared.
+    void setFedExternally(bool v) { fedExternally_ = v; }
+    bool fedExternally() const { return fedExternally_; }
+    void adoptRawText(const std::string &text);
 
     size_t issueCount();
     size_t openIssueCount();
@@ -45,10 +55,12 @@ public:
 
 private:
     void loadIfNeeded();
+    void ingestText(const std::string &text);   // shared by file read + adopt
 
     std::string jsonlPath_;
     std::string cachedText_;
     JsonArray  *cachedIssues_ = nullptr;   // owned
     bool loaded_ = false;
+    bool fedExternally_ = false;
     size_t cntOpen_ = 0, cntBlocked_ = 0, cntClosed_ = 0;
 };

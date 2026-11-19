@@ -22,15 +22,23 @@ JsonlDataSource::~JsonlDataSource() { if (cachedIssues_) json_array_unref(cached
 void JsonlDataSource::bindToPath(const std::string &path) {
     if (path == jsonlPath_) return;
     jsonlPath_ = path;
+    fedExternally_ = false;   // fresh project → file is the truth until told otherwise
+    loaded_ = false;          // reload() below would no-op if the flag were stale
     reload();
 }
 
 void JsonlDataSource::reload() {
+    if (fedExternally_) return;   // adopted (Dolt-exported) text is current
     loaded_ = false;
     cachedText_.clear();
     if (cachedIssues_) json_array_unref(cachedIssues_);
     cachedIssues_ = json_array_new();
     cntOpen_ = cntBlocked_ = cntClosed_ = 0;
+}
+
+void JsonlDataSource::adoptRawText(const std::string &text) {
+    loaded_ = true;
+    ingestText(text);
 }
 
 void JsonlDataSource::loadIfNeeded() {
@@ -46,8 +54,18 @@ void JsonlDataSource::loadIfNeeded() {
         if (err) g_error_free(err);
         return;
     }
-    // Store raw text; if not valid UTF-8, keep bytes as-is (viewer tolerates).
-    cachedText_.assign(data, len);
+    // Raw text; if not valid UTF-8, keep bytes as-is (viewer tolerates).
+    std::string text(data, len);
+    g_free(data);
+    ingestText(text);
+}
+
+// Shared by the file path and adoptRawText() — parse + recount.
+void JsonlDataSource::ingestText(const std::string &text) {
+    cachedText_ = text;
+    if (cachedIssues_) json_array_unref(cachedIssues_);
+    cachedIssues_ = json_array_new();
+    cntOpen_ = cntBlocked_ = cntClosed_ = 0;
 
     gchar **lines = g_strsplit(cachedText_.c_str(), "\n", -1);
     for (int i = 0; lines[i]; i++) {
@@ -56,10 +74,19 @@ void JsonlDataSource::loadIfNeeded() {
         JsonNode *node = beads::parseJson(t.c_str(), t.size());
         if (!node) continue;
         if (!JSON_NODE_HOLDS_OBJECT(node)) { json_node_free(node); continue; }
+        // Issue records only — bd 1.3 exports also carry other kinds
+        // (`"_type":"memory"` key/value notes with no id).
+        JsonObject *rec = json_node_get_object(node);
+        if (json_object_has_member(rec, "_type")) {
+            const char *kind = json_object_get_string_member(rec, "_type");
+            if (kind && strcmp(kind, "issue") != 0) { json_node_free(node); continue; }
+        }
+        const char *rid = json_object_has_member(rec, "id")
+            ? json_object_get_string_member(rec, "id") : nullptr;
+        if (!rid || !*rid) { json_node_free(node); continue; }
         json_array_add_element(cachedIssues_, node);   // takes ownership
     }
     g_strfreev(lines);
-    g_free(data);
 
     guint n = json_array_get_length(cachedIssues_);
     for (guint i = 0; i < n; i++) {

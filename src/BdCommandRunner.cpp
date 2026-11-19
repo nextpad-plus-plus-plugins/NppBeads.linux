@@ -74,6 +74,11 @@ std::vector<std::string> BdResult::blockerIds() const {
 
 // ── path resolution (Linux: no Homebrew) ────────────────────────────────────
 static std::string resolveBdBinary() {
+    // Explicit override first — the self-test points it at a stub bd, and a
+    // user with an unusual install location can set it too.
+    const char *envBd = g_getenv("NPPBEADS_BD");
+    if (envBd && *envBd && g_file_test(envBd, G_FILE_TEST_IS_EXECUTABLE))
+        return envBd;
     const char *home = g_get_home_dir();
     std::vector<std::string> candidates = {
         std::string(home) + "/.local/bin/bd",
@@ -349,6 +354,80 @@ void BdCommandRunner::probe(std::function<void(bool, bool)> done, bool force) {
     });
 }
 
+// ── events feed (bd >= 1.3) ─────────────────────────────────────────────────
+bool BdCommandRunner::supportsEventsFeed() const {
+    if (bdVersion_.empty()) return false;
+    int major = 0, minor = 0;
+    if (sscanf(bdVersion_.c_str(), "%d.%d", &major, &minor) < 2) return false;
+    return major > 1 || (major == 1 && minor >= 3);
+}
+
+void BdCommandRunner::fetchEventsJournalEnabled(std::function<void(bool)> done) {
+    execute({ "config", "get", "events-journal" }, nullptr, false,
+            [done](const BdResultPtr &r) {
+        std::string out = beads::trim(r->rawStdout);
+        bool enabled = r->ok && out == "true";
+        if (done) done(enabled);
+    });
+}
+
+void BdCommandRunner::enableEventsJournal(BdCompletion done) {
+    execute({ "config", "set", "events-journal", "true" }, nullptr, false,
+            std::move(done));
+}
+
+// ── data-source priority support ────────────────────────────────────────────
+void BdCommandRunner::exportAllJsonl(BdCompletion done) {
+    execute({ "export", "--all" }, nullptr, false, std::move(done));
+}
+
+void BdCommandRunner::exportJsonlToProjectFile(BdCompletion done) {
+    execute({ "export", "--all", "-o", ".beads/issues.jsonl" }, nullptr, false,
+            std::move(done));
+}
+
+// Every successful WRITE funnels through here (replaces the bare
+// invalidateCache the write completions used to call). In jsonl-priority
+// mode, schedule ONE import→export reconcile ~0.4 s after the last write of
+// a burst (generation counter; everything runs on the GLib main loop).
+void BdCommandRunner::noteSuccessfulWrite() {
+    invalidateCache();
+    if (!reconcileJsonlAfterWrite_) return;
+    guint64 gen = ++reconcileGen_;
+    std::weak_ptr<int> weak = aliveToken_;
+    auto *fire = new std::function<void()>([this, gen, weak]() {
+        if (weak.expired()) return;   // runner destroyed (project rebound)
+        if (gen != reconcileGen_ || !reconcileJsonlAfterWrite_) return;
+        // Import first (stale-guarded; protects a freshly pulled, newer
+        // jsonl from being clobbered), then export the merged truth back.
+        execute({ "import" }, nullptr, false, [this, weak](const BdResultPtr &imp) {
+            if (weak.expired()) return;
+            if (!imp->ok) g_warning("[NppBeads] jsonl reconcile: import failed — %s",
+                                    imp->errorMessage.c_str());
+            execute({ "export", "--all", "-o", ".beads/issues.jsonl" }, nullptr, false,
+                    [weak](const BdResultPtr &exp) {
+                if (weak.expired()) return;
+                if (!exp->ok) g_warning("[NppBeads] jsonl reconcile: export failed — %s",
+                                        exp->errorMessage.c_str());
+                else g_message("[NppBeads] jsonl reconcile after write: imported+exported");
+            });
+        });
+    });
+    g_timeout_add(400, [](gpointer p) -> gboolean {
+        auto *f = static_cast<std::function<void()> *>(p);
+        (*f)(); delete f; return G_SOURCE_REMOVE;
+    }, fire);
+}
+
+// unknown-flag detector for version-dependent CLI fallbacks.
+static bool isUnknownFlagError(const BdResultPtr &r) {
+    if (r->ok) return false;
+    gchar *low = g_ascii_strdown((r->errorMessage + " " + r->rawStderr).c_str(), -1);
+    bool hit = low && strstr(low, "unknown flag");
+    g_free(low);
+    return hit;
+}
+
 // ── reads ────────────────────────────────────────────────────────────────────
 void BdCommandRunner::listAllIssues(BdCompletion done) {
     const std::string key = "list|--all";
@@ -362,11 +441,23 @@ void BdCommandRunner::showIssue(const std::string &id, BdCompletion done) {
     if (id.empty()) { auto r = std::make_shared<BdResult>(); r->errorMessage = "issueId is empty"; if (done) done(r); return; }
     const std::string key = "show|" + id;
     if (auto hit = cachedFor(key, 0.25)) { if (done) done(hit); return; }
-    execute({ "show", id, "--json" }, nullptr, true, [this, key, done](const BdResultPtr &r) {
+    auto finish = [this, key, done](const BdResultPtr &r) {
         unwrapArrayToSingle(r.get());
         if (r->ok && !r->json) { r->ok = false; r->errorMessage = "bd show returned empty — issue likely not found"; }
         if (r->ok) cacheStore(r, key, 0.25);
         if (done) done(r);
+    };
+    // bd 1.3 omits comment BODIES from `show --json` by default (the issue
+    // carries comment_count + comments_omitted instead) — the modal's comment
+    // thread needs them, so ask explicitly. Older bd doesn't know the flag
+    // (it always included comments) — fall back.
+    execute({ "show", id, "--include-comments", "--json" }, nullptr, true,
+            [this, id, finish](const BdResultPtr &r) {
+        if (isUnknownFlagError(r)) {
+            execute({ "show", id, "--json" }, nullptr, true, finish);
+            return;
+        }
+        finish(r);
     });
 }
 void BdCommandRunner::ready(BdCompletion done) {
@@ -406,7 +497,7 @@ void BdCommandRunner::createIssue(const std::string &title, const char *type,
     args.push_back("--json");
     execute(args, haveStdin ? &stdinText : nullptr, true, [this, done](const BdResultPtr &r) {
         unwrapArrayToSingle(r.get());
-        if (r->ok) invalidateCache();
+        if (r->ok) noteSuccessfulWrite();
         if (done) done(r);
     });
 }
@@ -425,7 +516,10 @@ void BdCommandRunner::updateIssue(const std::string &id, const char *title,
     if (assignee && *assignee) { args.push_back("--assignee"); args.push_back(assignee); }
     std::string stdinText; bool haveStdin = false;
     if (description) {  // nullptr = untouched; "" = clear
-        if (needsStdin(description)) { args.push_back("--description-file=-"); stdinText = description; haveStdin = true; }
+        // `--body-file -` reads the description from stdin and exists on both
+        // bd 1.0.x and 1.3.x; the old `--description-file` spelling was
+        // removed in bd 1.3 ("unknown flag").
+        if (needsStdin(description)) { args.push_back("--body-file=-"); stdinText = description; haveStdin = true; }
         else { args.push_back("--description"); args.push_back(description); }
     }
     if (!addLabels.empty()) { args.push_back("--add-label"); args.push_back(joinComma(addLabels)); }
@@ -433,7 +527,7 @@ void BdCommandRunner::updateIssue(const std::string &id, const char *title,
     args.push_back("--json");
     execute(args, haveStdin ? &stdinText : nullptr, true, [this, done](const BdResultPtr &r) {
         unwrapArrayToSingle(r.get());
-        if (r->ok) invalidateCache();
+        if (r->ok) noteSuccessfulWrite();
         if (done) done(r);
     });
 }
@@ -442,7 +536,7 @@ void BdCommandRunner::claimIssue(const std::string &id, BdCompletion done) {
     if (id.empty()) { auto r = std::make_shared<BdResult>(); r->errorMessage = "issueId is empty"; if (done) done(r); return; }
     execute({ "update", id, "--claim", "--json" }, nullptr, true, [this, done](const BdResultPtr &r) {
         unwrapArrayToSingle(r.get());
-        if (r->ok) invalidateCache();
+        if (r->ok) noteSuccessfulWrite();
         if (done) done(r);
     });
 }
@@ -454,7 +548,7 @@ void BdCommandRunner::closeIssue(const std::string &id, const char *reason, bool
     args.push_back("--json");
     execute(args, nullptr, true, [this, done](const BdResultPtr &r) {
         unwrapArrayToSingle(r.get());
-        if (r->ok) invalidateCache();
+        if (r->ok) noteSuccessfulWrite();
         if (done) done(r);
     });
 }
@@ -465,7 +559,7 @@ void BdCommandRunner::reopenIssue(const std::string &id, const char *reason, BdC
     args.push_back("--json");
     execute(args, nullptr, true, [this, done](const BdResultPtr &r) {
         unwrapArrayToSingle(r.get());
-        if (r->ok) invalidateCache();
+        if (r->ok) noteSuccessfulWrite();
         if (done) done(r);
     });
 }
@@ -474,28 +568,44 @@ void BdCommandRunner::addDependency(const std::string &dependent, const std::str
     if (dependent.empty() || dependency.empty()) { auto r = std::make_shared<BdResult>(); r->errorMessage = "dependentId and dependencyId both required"; if (done) done(r); return; }
     std::string type = depType.empty() ? "blocks" : depType;
     execute({ "dep", "add", dependent, dependency, "--type", type, "--json" }, nullptr, true,
-            [this, done](const BdResultPtr &r) { if (r->ok) invalidateCache(); if (done) done(r); });
+            [this, done](const BdResultPtr &r) { if (r->ok) noteSuccessfulWrite(); if (done) done(r); });
 }
 void BdCommandRunner::removeDependency(const std::string &dependent, const std::string &dependency, BdCompletion done) {
     if (dependent.empty() || dependency.empty()) { auto r = std::make_shared<BdResult>(); r->errorMessage = "dependentId and dependencyId both required"; if (done) done(r); return; }
     execute({ "dep", "remove", dependent, dependency, "--json" }, nullptr, true,
-            [this, done](const BdResultPtr &r) { if (r->ok) invalidateCache(); if (done) done(r); });
+            [this, done](const BdResultPtr &r) { if (r->ok) noteSuccessfulWrite(); if (done) done(r); });
 }
 void BdCommandRunner::deleteIssue(const std::string &id, BdCompletion done) {
     if (id.empty()) { auto r = std::make_shared<BdResult>(); r->errorMessage = "issueId is empty"; if (done) done(r); return; }
     execute({ "delete", id, "--force", "--json" }, nullptr, true,
-            [this, done](const BdResultPtr &r) { if (r->ok) invalidateCache(); if (done) done(r); });
+            [this, done](const BdResultPtr &r) { if (r->ok) noteSuccessfulWrite(); if (done) done(r); });
 }
 void BdCommandRunner::unassignIssue(const std::string &id, BdCompletion done) {
     if (id.empty()) { auto r = std::make_shared<BdResult>(); r->errorMessage = "issueId is empty"; if (done) done(r); return; }
-    execute({ "update", id, "--unassign", "--json" }, nullptr, true, [this, done](const BdResultPtr &r) {
+    auto finish = [this, done](const BdResultPtr &r) {
         unwrapArrayToSingle(r.get());
-        if (r->ok) invalidateCache();
+        if (r->ok) noteSuccessfulWrite();
         if (done) done(r);
+    };
+    // bd 1.0.x: `bd update <id> --unassign`. bd 1.3 removed --unassign; there
+    // `bd assign <id> ""` clears the assignee (on 1.0.x an empty --assignee
+    // means "no change", so the flag must stay the first choice). Try the old
+    // form, fall back on "unknown flag".
+    execute({ "update", id, "--unassign", "--json" }, nullptr, true,
+            [this, id, finish](const BdResultPtr &r) {
+        if (isUnknownFlagError(r)) {
+            execute({ "assign", id, "", "--json" }, nullptr, true, finish);
+            return;
+        }
+        finish(r);
     });
 }
 void BdCommandRunner::addComment(const std::string &id, const std::string &body, BdCompletion done) {
     if (id.empty() || body.empty()) { auto r = std::make_shared<BdResult>(); r->errorMessage = id.empty() ? "issueId is empty" : "comment body is empty"; if (done) done(r); return; }
-    execute({ "comment", "add", id, "--body-file=-", "--json" }, &body, true,
-            [this, done](const BdResultPtr &r) { if (r->ok) invalidateCache(); if (done) done(r); });
+    // bd 1.0.2 CLI: `bd comment <id> --stdin` — the singular `comment` is
+    // itself the add shorthand (there is no `comment add` subcommand), and
+    // the old `--body-file` flag no longer exists on it. Routing the body via
+    // stdin survives newlines, quotes, $, backticks, and anything else pasted.
+    execute({ "comment", id, "--stdin", "--json" }, &body, true,
+            [this, done](const BdResultPtr &r) { if (r->ok) noteSuccessfulWrite(); if (done) done(r); });
 }

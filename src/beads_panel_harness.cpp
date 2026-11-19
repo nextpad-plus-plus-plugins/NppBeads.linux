@@ -124,6 +124,18 @@ int main(int argc, char **argv) {
     // the JS bridge and log the resolved payload. On the JSONL backend this
     // must come back {ok:false, errorKind:1} (ReadOnly) — proving the full
     // beadsBridge → handler → data source → __nppBridge.resolve loop.
+    // Late data probe: after NPPBEADS_TEST_COUNT_AT seconds, log how many
+    // issue lines the webview's preloaded JSONL currently holds — proves a
+    // live-sync rebroadcast actually reached the page.
+    if (const char *at = g_getenv("NPPBEADS_TEST_COUNT_AT")) {
+        g_timeout_add_seconds(atoi(at), [](gpointer p) -> gboolean {
+            static_cast<BeadsPanel *>(p)->injectJS(
+                "console.log('HARNESSCOUNT ' + ((window.__nppBeadsPreloadedJsonl||'')"
+                ".split('\\n').filter(l=>l.trim()).length));");
+            return G_SOURCE_REMOVE;
+        }, panel);
+    }
+
     if (g_getenv("NPPBEADS_TEST_BRIDGE")) {
         g_timeout_add_seconds(3, [](gpointer p) -> gboolean {
             static_cast<BeadsPanel *>(p)->injectJS(

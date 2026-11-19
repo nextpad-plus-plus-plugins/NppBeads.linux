@@ -62,6 +62,38 @@ public:
     void probe(std::function<void(bool bdPresent, bool projectReady)> done,
                bool forceRefresh = false);
 
+    // ── Events feed (bd >= 1.3) — version gate + per-workspace journal config.
+
+    // True when the probed bd version has `bd events tail` (>= 1.3).
+    // Valid only after probe() has resolved.
+    bool supportsEventsFeed() const;
+
+    // `bd config get events-journal` → true iff it prints "true".
+    void fetchEventsJournalEnabled(std::function<void(bool enabled)> done);
+
+    // `bd config set events-journal true` — writes the project's
+    // .beads/config.yaml (which may be git-tracked; the UI warns first).
+    void enableEventsJournal(BdCompletion done);
+
+    // ── Data-source priority support (render-from-Dolt + jsonl escape hatch).
+
+    // `bd export --all` to STDOUT — the canonical JSONL text, fresh from the
+    // Dolt database, exactly the shape the webview consumes. Side-effect
+    // free (does NOT touch .beads/issues.jsonl); res->rawStdout carries it.
+    void exportAllJsonl(BdCompletion done);
+
+    // `bd export --all -o .beads/issues.jsonl` — refresh the on-disk file
+    // from Dolt (manual "Export now" + jsonl-mode reconcile).
+    void exportJsonlToProjectFile(BdCompletion done);
+
+    // When true (the panel sets this in jsonl-priority mode), every
+    // successful bd WRITE schedules a coalesced reconcile: `bd import`
+    // (stale-guarded — folds any NEWER rows from the file, e.g. a freshly
+    // git-pulled jsonl, into Dolt) followed by `bd export -o` so the file
+    // reflects the merged truth. Off by default.
+    void setReconcileJsonlAfterWrite(bool v) { reconcileJsonlAfterWrite_ = v; }
+    bool reconcileJsonlAfterWrite() const { return reconcileJsonlAfterWrite_; }
+
     // Reads (cached).
     void listAllIssues(BdCompletion done);
     void showIssue(const std::string &id, BdCompletion done);
@@ -97,6 +129,9 @@ private:
                  bool expectsJson, BdCompletion done);
     BdResultPtr cachedFor(const std::string &key, double ttlSec);
     void cacheStore(const BdResultPtr &res, const std::string &key, double ttlSec);
+    // Every successful WRITE funnels through here (invalidate + optional
+    // coalesced jsonl reconcile ~0.4 s after the last write of a burst).
+    void noteSuccessfulWrite();
 
     std::string projectDir_;
     std::string bdPath_;
@@ -105,5 +140,10 @@ private:
     bool useSandbox_ = true;
     bool probed_ = false;
     bool projectReady_ = false;
+    bool reconcileJsonlAfterWrite_ = false;
+    guint64 reconcileGen_ = 0;             // reconcile burst coalescing
+    // Liveness token: deferred callbacks (reconcile timeout) hold a weak_ptr
+    // and bail once the runner is gone (rebind destroys it mid-flight).
+    std::shared_ptr<int> aliveToken_ = std::make_shared<int>(0);
     std::map<std::string, CacheEntry> cache_;
 };

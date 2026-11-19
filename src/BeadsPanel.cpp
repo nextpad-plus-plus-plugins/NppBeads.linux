@@ -100,6 +100,7 @@ BeadsPanel::BeadsPanel(const std::string &resourcesDir) : resourcesDir_(resource
 
 BeadsPanel::~BeadsPanel() {
     if (poll_) poll_->stop();
+    if (tail_) tail_->stop();
     watcher_->stop();
     // root_ is owned by the host once docked; do not destroy it here.
 }
@@ -165,6 +166,28 @@ GtkWidget *BeadsPanel::makeToolbar() {
         }), this);
     g_action_map_add_action(G_ACTION_MAP(ag), G_ACTION(pick));
     g_object_unref(pick);
+    // Data-source priority — stateful radio pair ("dolt" | "jsonl"),
+    // persisted per project (macOS 20c5103 Data Source submenu).
+    datasrcAction_ = g_simple_action_new_stateful("datasrc", G_VARIANT_TYPE_STRING,
+                                                  g_variant_new_string("dolt"));
+    g_simple_action_set_enabled(datasrcAction_, FALSE);
+    g_signal_connect(datasrcAction_, "activate",
+        G_CALLBACK(+[](GSimpleAction *a, GVariant *param, gpointer s){
+            const char *v = g_variant_get_string(param, nullptr);
+            g_simple_action_set_state(a, g_variant_new_string(v));
+            static_cast<BeadsPanel*>(s)->setDataSourcePriorityJsonl(
+                g_strcmp0(v, "jsonl") == 0);
+        }), this);
+    g_action_map_add_action(G_ACTION_MAP(ag), G_ACTION(datasrcAction_));
+    g_object_unref(datasrcAction_);   // group holds the ref
+    exportAction_ = g_simple_action_new("exportnow", nullptr);
+    g_simple_action_set_enabled(exportAction_, FALSE);
+    g_signal_connect(exportAction_, "activate",
+        G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer s){
+            static_cast<BeadsPanel*>(s)->exportJsonlNow();
+        }), this);
+    g_action_map_add_action(G_ACTION_MAP(ag), G_ACTION(exportAction_));
+    g_object_unref(exportAction_);
     gtk_widget_insert_action_group(root_, "beads", G_ACTION_GROUP(ag));
     g_object_unref(ag);
 
@@ -180,8 +203,8 @@ GtkWidget *BeadsPanel::makeToolbar() {
         }), this);
     }
 
-    // View-mode dropdown.
-    const char *modes[] = { "Dashboard", "Issues", "Insights", "Graph", "Board", "Activity", nullptr };
+    // View-mode dropdown (Issues retired; Activity replaces it — macOS order).
+    const char *modes[] = { "Dashboard", "Insights", "Activity", "Board", "Graph", nullptr };
     viewModeDrop_ = gtk_drop_down_new_from_strings(modes);
     g_signal_connect(viewModeDrop_, "notify::selected", G_CALLBACK(s_viewModeChanged), this);
     gtk_box_append(GTK_BOX(row), viewModeDrop_);
@@ -225,10 +248,12 @@ void BeadsPanel::rebuildProjectMenu() {
     roots.erase(std::remove(roots.begin(), roots.end(), cur), roots.end());
 
     // Signature: everything that affects menu content.
+    bool bdActive = bdDataSource_ && activeDataSource_ == bdDataSource_.get();
     std::string sig = cur + "\x1e";
     for (auto &r : roots) { sig += r; sig += "\x1f"; }
     sig += project_ ? "P" : "-";
     sig += hideHandler_ ? "H" : "-";
+    sig += bdActive ? "B" : "-";
     if (sig == projectMenuSig_) return;
     projectMenuSig_ = sig;
 
@@ -277,6 +302,29 @@ void BeadsPanel::rebuildProjectMenu() {
             g_menu_append(sec, "Reveal .beads/ folder",   "beads.reveal");
         }
         g_menu_append(sec, "Reload viewer", "beads.reloadviewer");
+        g_menu_append_section(projectMenu_, nullptr, G_MENU_MODEL(sec));
+        g_object_unref(sec);
+    }
+
+    // Data-source priority (Dolt-live default · issues.jsonl escape hatch) +
+    // manual export — bd backend only (macOS keeps these on the context menu;
+    // the chip menu is the Linux home for both).
+    if (bdActive) {
+        GMenu *sec = g_menu_new();
+        GMenu *srcMenu = g_menu_new();
+        GMenuItem *dolt = g_menu_item_new("Prefer local Dolt DB (live via bd)", nullptr);
+        g_menu_item_set_action_and_target_value(dolt, "beads.datasrc",
+            g_variant_new_string("dolt"));
+        g_menu_append_item(srcMenu, dolt);
+        g_object_unref(dolt);
+        GMenuItem *jsonl = g_menu_item_new("Prefer issues.jsonl (file on disk)", nullptr);
+        g_menu_item_set_action_and_target_value(jsonl, "beads.datasrc",
+            g_variant_new_string("jsonl"));
+        g_menu_append_item(srcMenu, jsonl);
+        g_object_unref(jsonl);
+        g_menu_append_submenu(sec, "Data Source", G_MENU_MODEL(srcMenu));
+        g_object_unref(srcMenu);
+        g_menu_append(sec, "Export issues.jsonl now (from Dolt)", "beads.exportnow");
         g_menu_append_section(projectMenu_, nullptr, G_MENU_MODEL(sec));
         g_object_unref(sec);
     }
@@ -342,7 +390,8 @@ void BeadsPanel::openBeadsFolderDialog() {
                 GtkAlertDialog *a = gtk_alert_dialog_new("Not a beads project");
                 gtk_alert_dialog_set_detail(a,
                     "The chosen directory doesn't contain a usable .beads/ "
-                    "folder (expected issues.jsonl or beads.db inside).");
+                    "folder (expected issues.jsonl, beads.db, or an "
+                    "embeddeddolt/ database inside).");
                 GtkRoot *w = gtk_widget_get_root(self->root_);
                 gtk_alert_dialog_show(a, GTK_IS_WINDOW(w) ? GTK_WINDOW(w) : nullptr);
                 g_object_unref(a);
@@ -387,11 +436,10 @@ void BeadsPanel::setupWebView() {
 std::string BeadsPanel::urlForViewMode(BeadsViewMode m) const {
     switch (m) {
         case BeadsViewMode::Dashboard: return "nppbeads://viewer/index.html#/";
-        case BeadsViewMode::Issues:    return "nppbeads://viewer/index.html#/issues";
         case BeadsViewMode::Insights:  return "nppbeads://viewer/index.html#/insights";
-        case BeadsViewMode::Graph:     return "nppbeads://viewer/index.html#/graph";
-        case BeadsViewMode::Board:     return "nppbeads://viewer/app/board.html";
         case BeadsViewMode::Activity:  return "nppbeads://viewer/app/activity.html";
+        case BeadsViewMode::Board:     return "nppbeads://viewer/app/board.html";
+        case BeadsViewMode::Graph:     return "nppbeads://viewer/index.html#/graph";
     }
     return "nppbeads://viewer/index.html#/";
 }
@@ -470,10 +518,46 @@ void BeadsPanel::pushJsonlToBridge() {
 }
 
 void BeadsPanel::broadcastDataChanged() {
+    // Dolt-priority render: pull canonical JSONL text straight from the
+    // database (`bd export --all` to stdout — same schema as the file, incl.
+    // dependencies), adopt it into ds_ so counts/preload stay on one code
+    // path, then push. The jsonl FILE is not consulted, so bd 1.3's export
+    // throttling can't make the view stale.
+    if (renderFromBd_ && bdRunner_ &&
+        bdDataSource_ && activeDataSource_ == bdDataSource_.get()) {
+        if (bcInFlight_) { bcPending_ = true; return; }
+        bcInFlight_ = true;
+        activeDataSource_->invalidateCache();
+        BdCommandRunner *runner = bdRunner_.get();
+        runner->exportAllJsonl([this, runner](const BdResultPtr &res) {
+            bcInFlight_ = false;
+            if (bdRunner_.get() != runner) return;   // superseded by later bind
+            std::string fresh;
+            if (res->ok) {
+                fresh = res->rawStdout;
+                ds_->adoptRawText(fresh);
+            } else {
+                g_message("[NppBeads] dolt render refresh failed (%s) — keeping last data",
+                          res->errorMessage.empty() ? "?" : res->errorMessage.c_str());
+                fresh = ds_->rawText();
+            }
+            refreshStatusBar();
+            pushJsonlToWebview(fresh);
+            if (bcPending_) { bcPending_ = false; broadcastDataChanged(); }
+        });
+        return;
+    }
+
+    // jsonl-priority (or no bd backend): the file on disk is the truth.
     activeDataSource_->invalidateCache();
     ds_->reload();
     std::string fresh = ds_->rawText();
     refreshStatusBar();
+    pushJsonlToWebview(fresh);
+}
+
+void BeadsPanel::pushJsonlToWebview(const std::string &fresh) {
+    jsonlBytesLastSeen_ = fresh.size();   // keep reloadData's change gate honest
     std::string jsLit = beads_jsStringLiteral(fresh);
     std::string js =
         "window.__nppBeadsPreloadedJsonl = " + jsLit + ";"
@@ -516,8 +600,10 @@ void BeadsPanel::pushSearchQuery(const std::string &q) {
     std::string lit = beads_jsStringLiteral(q);
     if (viewMode_ == BeadsViewMode::Board || viewMode_ == BeadsViewMode::Activity)
         runJS("if(window.__nppApp&&window.__nppApp.setFilter)window.__nppApp.setFilter({query:" + lit + "});");
-    else if (viewMode_ == BeadsViewMode::Issues)
-        runJS("if(window.__nppRichSearch)window.__nppRichSearch(" + lit + ");");
+    else if (viewMode_ == BeadsViewMode::Graph)
+        // Find-node (isolate matches + neighbours); bridge.js parks the
+        // query until the graph loads.
+        runJS("if(window.__nppGraphSearch)window.__nppGraphSearch(" + lit + ");");
 }
 
 // ── view mode ────────────────────────────────────────────────────────────────
@@ -549,7 +635,17 @@ void BeadsPanel::bindProject(std::shared_ptr<BeadsProject> project) {
         return;
     }
 
+    // Tear down any previous-project live-sync BEFORE changing state.
+    // BeadsPoll's stop bumps its generation counter so any in-flight bd
+    // completion for the old project becomes a no-op; the events tail
+    // terminates its child process.
     if (poll_) { poll_->stop(); poll_.reset(); }
+    if (tail_) { tail_->stop(); tail_.reset(); }
+    renderFromBd_ = false;      // until the new project's probe says otherwise
+    bcInFlight_ = false;
+    bcPending_  = false;
+    if (datasrcAction_) g_simple_action_set_enabled(datasrcAction_, FALSE);
+    if (exportAction_)  g_simple_action_set_enabled(exportAction_, FALSE);
     project_ = project;
     ds_->bindToPath(project ? project->jsonlPath : "");
     watcher_->watchPath(project ? project->jsonlPath : "");
@@ -587,18 +683,196 @@ void BeadsPanel::selectDataSourceForProject() {
         if (bdPresent && projectReady) {
             bdDataSource_ = std::make_unique<BdDataSource>(bdRunner_);
             activeDataSource_ = bdDataSource_.get();
-            poll_ = std::make_unique<BeadsPoll>(bdRunner_, 2000);
-            poll_->onChange = [this](const std::string &) { broadcastDataChanged(); };
-            poll_->start();
-            g_message("[NppBeads] bd backend active — %s", activeDataSource_->backendLabel().c_str());
+            // Data-source priority: default is render-from-Dolt; the
+            // per-project jsonl escape hatch flips the view back to the file
+            // (and reconciles it after every write).
+            bool jsonlPri = BeadsRecent::jsonlPriorityFor(project_->projectRoot);
+            renderFromBd_ = !jsonlPri;
+            ds_->setFedExternally(renderFromBd_);
+            probed->setReconcileJsonlAfterWrite(jsonlPri);
+            if (datasrcAction_) {
+                g_simple_action_set_enabled(datasrcAction_, TRUE);
+                g_simple_action_set_state(datasrcAction_,
+                    g_variant_new_string(jsonlPri ? "jsonl" : "dolt"));
+            }
+            if (exportAction_) g_simple_action_set_enabled(exportAction_, TRUE);
+            projectMenuSig_.clear();   // menu gains the Data Source section
+            g_message("[NppBeads] bd backend active — %s (render: %s)",
+                      activeDataSource_->backendLabel().c_str(),
+                      renderFromBd_ ? "dolt" : "jsonl");
+            // Live sync: events feed on bd >= 1.3 (with a one-time
+            // per-project opt-in prompt for the journal), else the 2s poll.
+            startLiveSync(probed);
+            // Upgrade the view from the bind-time file snapshot to the live
+            // database (or re-read the file in jsonl mode).
+            broadcastDataChanged();
         } else {
+            renderFromBd_ = false;
+            ds_->setFedExternally(false);
             g_message("[NppBeads] JSONL fallback (bd=%d, ready=%d)", bdPresent, projectReady);
         }
         refreshStatusBar();
     });
 }
 
+// ── live sync — events feed (bd >= 1.3, opt-in journal) with poll fallback ──
+void BeadsPanel::startLiveSync(BdCommandRunner *runner) {
+    if (!runner->supportsEventsFeed() || runner->bdPath().empty()) {
+        startPoll(runner);
+        return;
+    }
+    runner->fetchEventsJournalEnabled([this, runner](bool enabled) {
+        if (bdRunner_.get() != runner) return;   // superseded by later bind
+        if (enabled) startTail(runner);
+        else         offerEventsFeed(runner);
+    });
+}
+
+void BeadsPanel::startPoll(BdCommandRunner *runner) {
+    if (poll_) poll_->stop();
+    poll_ = std::make_unique<BeadsPoll>(bdRunner_, 2000);
+    poll_->onChange = [this](const std::string &) { broadcastDataChanged(); };
+    poll_->start();
+    g_message("[NppBeads] live sync: 2s poll (bd %s)",
+              runner->bdVersion().empty() ? "?" : runner->bdVersion().c_str());
+}
+
+void BeadsPanel::startTail(BdCommandRunner *runner) {
+    if (tail_) { tail_->stop(); tail_.reset(); }
+    std::string root = runner->projectDir();
+    auto tail = std::make_unique<BdEventsTail>(runner->bdPath(), root);
+    tail->setSinceSeq(BeadsRecent::eventsSeqFor(root));
+    tail->onChange = [this, runner, root]() {
+        if (bdRunner_.get() != runner || !tail_) return;
+        BeadsRecent::setEventsSeq(root, tail_->lastSeq());
+        g_message("[NppBeads] events feed change (records=%u seq=%llu) — rebroadcasting",
+                  tail_->recordCount(), (unsigned long long)tail_->lastSeq());
+        broadcastDataChanged();
+    };
+    tail->onBroken = [this, runner](const std::string &reason) {
+        if (bdRunner_.get() != runner) return;
+        g_message("[NppBeads] events feed broken (%s) — falling back to 2s poll",
+                  reason.c_str());
+        tail_.reset();
+        startPoll(runner);
+        broadcastDataChanged();      // resync once; we may have missed changes
+    };
+    tail_ = std::move(tail);
+    tail_->start();
+    g_message("[NppBeads] live sync: events feed (bd %s, since=%llu)",
+              runner->bdVersion().c_str(), (unsigned long long)tail_->sinceSeq());
+}
+
+// One-time per-project prompt before flipping the journal on, because
+// `bd config set events-journal true` writes .beads/config.yaml, which is
+// often tracked in git. Any remembered answer suppresses the prompt forever;
+// a user who later runs the config command themselves is picked up by the
+// fetchEventsJournalEnabled check on the next bind.
+void BeadsPanel::offerEventsFeed(BdCommandRunner *runner) {
+    std::string root = runner->projectDir();
+    if (!BeadsRecent::eventsAnswerFor(root).empty()) {
+        // Already asked (or previously enabled and since turned off outside
+        // the panel) — don't nag; poll.
+        startPoll(runner);
+        return;
+    }
+    GtkRoot *win = gtk_widget_get_root(root_);
+    if (!GTK_IS_WINDOW(win)) {
+        // No UI to ask with right now. Poll for this session WITHOUT
+        // recording an answer, so the prompt can happen on a later bind.
+        startPoll(runner);
+        return;
+    }
+    GtkAlertDialog *a = gtk_alert_dialog_new("Enable live updates for this project?");
+    std::string detail =
+        "Beads " + (runner->bdVersion().empty() ? std::string("1.3") : runner->bdVersion()) +
+        " can stream changes to this panel as they happen (bd events journal) "
+        "instead of polling every 2 seconds.\n\n"
+        "Enabling writes \"events-journal: true\" into this project's "
+        ".beads/config.yaml — note that file may be tracked in git.\n\n"
+        "You can also enable it later yourself:\n"
+        "bd config set events-journal true";
+    gtk_alert_dialog_set_detail(a, detail.c_str());
+    const char *buttons[] = { "Enable Live Updates", "Not Now", nullptr };
+    gtk_alert_dialog_set_buttons(a, buttons);
+    gtk_alert_dialog_set_default_button(a, 0);
+    gtk_alert_dialog_set_cancel_button(a, 1);
+    struct OfferCtx { BeadsPanel *self; BdCommandRunner *runner; std::string root; };
+    auto *ctx = new OfferCtx{ this, runner, root };
+    gtk_alert_dialog_choose(a, GTK_WINDOW(win), nullptr,
+        +[](GObject *src, GAsyncResult *res, gpointer user) {
+            auto *ctx = static_cast<OfferCtx *>(user);
+            BeadsPanel *self = ctx->self;
+            BdCommandRunner *runner = ctx->runner;
+            std::string root = ctx->root;
+            delete ctx;
+            int btn = gtk_alert_dialog_choose_finish(GTK_ALERT_DIALOG(src), res, nullptr);
+            if (self->bdRunner_.get() != runner) return;   // rebound meanwhile
+            if (btn == 0) {
+                BeadsRecent::setEventsAnswer(root, "enabled");
+                runner->enableEventsJournal([self, runner](const BdResultPtr &r) {
+                    if (self->bdRunner_.get() != runner) return;
+                    if (r->ok) {
+                        self->startTail(runner);
+                    } else {
+                        g_message("[NppBeads] enabling events journal failed: %s — polling",
+                                  r->errorMessage.c_str());
+                        self->startPoll(runner);
+                    }
+                });
+            } else {
+                BeadsRecent::setEventsAnswer(root, "declined");
+                self->startPoll(runner);
+            }
+        }, ctx);
+    g_object_unref(a);
+}
+
+// ── Data Source priority (Dolt-live default · issues.jsonl escape hatch) ───
+void BeadsPanel::setDataSourcePriorityJsonl(bool jsonlPriority) {
+    if (!project_ || project_->projectRoot.empty()) { gtk_widget_error_bell(root_); return; }
+    BeadsRecent::setJsonlPriority(project_->projectRoot, jsonlPriority);
+    bool bdActive = bdDataSource_ && activeDataSource_ == bdDataSource_.get();
+    renderFromBd_ = bdActive && !jsonlPriority;
+    ds_->setFedExternally(renderFromBd_);
+    if (bdRunner_) bdRunner_->setReconcileJsonlAfterWrite(bdActive && jsonlPriority);
+    if (!renderFromBd_) ds_->reload();    // back to the file as the truth
+    g_message("[NppBeads] data source priority → %s for %s (bd %s)",
+              jsonlPriority ? "jsonl" : "dolt", project_->projectRoot.c_str(),
+              bdActive ? "active" : "inactive");
+    broadcastDataChanged();
+}
+
+void BeadsPanel::exportJsonlNow() {
+    if (!bdRunner_ || !(bdDataSource_ && activeDataSource_ == bdDataSource_.get())) {
+        gtk_widget_error_bell(root_);
+        return;
+    }
+    BdCommandRunner *runner = bdRunner_.get();
+    runner->exportJsonlToProjectFile([this, runner](const BdResultPtr &res) {
+        if (bdRunner_.get() != runner) return;
+        if (res->ok) {
+            g_message("[NppBeads] exported issues.jsonl from Dolt (manual)");
+            // The file may have just been created (Dolt-only workspace) —
+            // (re)arm the watcher, then refresh the view if it's file-driven.
+            if (project_ && !project_->jsonlPath.empty())
+                watcher_->watchPath(project_->jsonlPath);
+            if (!renderFromBd_) broadcastDataChanged();
+        } else {
+            GtkAlertDialog *a = gtk_alert_dialog_new("Export failed");
+            gtk_alert_dialog_set_detail(a, res->errorMessage.empty()
+                ? "bd export returned an error." : res->errorMessage.c_str());
+            GtkRoot *w = gtk_widget_get_root(root_);
+            gtk_alert_dialog_show(a, GTK_IS_WINDOW(w) ? GTK_WINDOW(w) : nullptr);
+            g_object_unref(a);
+        }
+    });
+}
+
 void BeadsPanel::reloadData() {
+    // Dolt-priority: "reload" means a fresh pull from the database, not a
+    // file re-read. broadcastDataChanged owns that path (incl. coalescing).
+    if (renderFromBd_ && bdRunner_) { broadcastDataChanged(); return; }
     ds_->reload();
     refreshStatusBar();
     std::string fresh = ds_->rawText();
@@ -660,9 +934,13 @@ void BeadsPanel::openBeadsDir() {
 }
 
 void BeadsPanel::setWindowActive(bool active) {
-    if (!poll_) return;
-    if (active) poll_->resume();
-    else        poll_->pause();
+    if (active) {
+        if (poll_) poll_->resume();
+        if (tail_) tail_->resume();   // flushes any change that arrived while blurred
+    } else {
+        if (poll_) poll_->pause();
+        if (tail_) tail_->pause();
+    }
 }
 
 std::vector<std::shared_ptr<BeadsProject>> BeadsPanel::discoverProjects(size_t max) {
@@ -676,10 +954,14 @@ void BeadsPanel::refreshTitleBar() {
     gtk_menu_button_set_label(GTK_MENU_BUTTON(projectChip_), label.c_str());
     if (project_) gtk_widget_set_tooltip_text(projectChip_, project_->projectRoot.c_str());
 
+    // Board + Activity filter their lists; on Graph it is Find-node.
+    // Dashboard / Insights are aggregates.
     bool showSearch = (viewMode_ == BeadsViewMode::Board ||
-                       viewMode_ == BeadsViewMode::Issues ||
-                       viewMode_ == BeadsViewMode::Activity);
+                       viewMode_ == BeadsViewMode::Activity ||
+                       viewMode_ == BeadsViewMode::Graph);
     gtk_widget_set_visible(searchEntry_, showSearch);
+    gtk_search_entry_set_placeholder_text(GTK_SEARCH_ENTRY(searchEntry_),
+        viewMode_ == BeadsViewMode::Graph ? "Find node" : "Search beads");
     if (!showSearch && !lastSearchQuery_.empty()) {
         gtk_editable_set_text(GTK_EDITABLE(searchEntry_), "");
         lastSearchQuery_ = "";
@@ -696,6 +978,9 @@ void BeadsPanel::refreshStatusBar() {
         size_t total = ds_->issueCount(), open = ds_->openIssueCount(),
                blk = ds_->blockedIssueCount(), cls = ds_->closedIssueCount();
         std::string backend = activeDataSource_ ? activeDataSource_->backendLabel() : "read-only (JSONL)";
+        if (bdDataSource_ && activeDataSource_ == bdDataSource_.get())
+            // Surface which source feeds the view so the mode is never invisible.
+            backend += renderFromBd_ ? " · dolt" : " · jsonl";
         char buf[512];
         g_snprintf(buf, sizeof buf,
             "%s · %zu issues (%zu open · %zu blocked · %zu closed) · %s",
@@ -719,11 +1004,14 @@ void BeadsPanel::onScriptMessage(JSCValue *msg) {
         return;
     }
     if (type == "openBeadDetails") {
+        // Issue details live in the Activity view's modal
+        // (activity.html?open=<id>) — the Issues view is retired.
         std::string id = jscStr(msg, "id");
         if (id.empty()) return;
-        setViewMode(BeadsViewMode::Dashboard, false);
+        setViewMode(BeadsViewMode::Activity, false);
         gchar *enc = g_uri_escape_string(id.c_str(), nullptr, FALSE);
-        std::string url = std::string("nppbeads://viewer/index.html#/issue/") + (enc ? enc : "");
+        std::string url = urlForViewMode(BeadsViewMode::Activity) +
+                          "?open=" + (enc ? enc : "");
         g_free(enc);
         viewerLoaded_ = false;
         installUserScripts();

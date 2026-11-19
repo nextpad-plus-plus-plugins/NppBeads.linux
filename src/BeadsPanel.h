@@ -13,6 +13,7 @@
 #include "BdDataSource.h"
 #include "BeadsWatcher.h"
 #include "BeadsPoll.h"
+#include "BdEventsTail.h"
 #include "BeadsSchemeHandler.h"
 
 #include <gtk/gtk.h>
@@ -22,7 +23,9 @@
 #include <set>
 #include <string>
 
-enum class BeadsViewMode { Dashboard = 0, Issues = 1, Insights = 2, Graph = 3, Board = 4, Activity = 5 };
+// View surfaces, in dropdown order (the Rich viewer's Issues list is retired;
+// Activity hosts every issue's detail modal — macOS 30bf81d).
+enum class BeadsViewMode { Dashboard = 0, Insights = 1, Activity = 2, Board = 3, Graph = 4 };
 enum class BeadsThemePref { Auto = 0, Light = 1, Dark = 2 };
 
 class BeadsPanel {
@@ -77,12 +80,21 @@ private:
     void runOnBoardView(const std::string &js);
     void pushJsonlToBridge();
     void broadcastDataChanged();
+    void pushJsonlToWebview(const std::string &fresh);
     void pushTheme();
     void pushSearchQuery(const std::string &q);
     bool isDark() const;
 
     // data source
     void selectDataSourceForProject();
+    void setDataSourcePriorityJsonl(bool jsonlPriority);
+    void exportJsonlNow();
+
+    // live sync — events feed (bd >= 1.3, opt-in journal) with poll fallback
+    void startLiveSync(BdCommandRunner *runner);
+    void startPoll(BdCommandRunner *runner);
+    void startTail(BdCommandRunner *runner);
+    void offerEventsFeed(BdCommandRunner *runner);
 
     // bridge
     void onScriptMessage(JSCValue *msg);
@@ -130,6 +142,17 @@ private:
     std::unique_ptr<BdDataSource> bdDataSource_;
     BeadsDataSource *activeDataSource_ = nullptr;
     std::unique_ptr<BeadsPoll> poll_;
+    std::unique_ptr<BdEventsTail> tail_;   // events-feed live sync (bd >= 1.3);
+                                           // mutually exclusive with poll_
+    GSimpleAction *datasrcAction_ = nullptr;   // owned by the action group
+    GSimpleAction *exportAction_ = nullptr;
+
+    // Data-source priority: when true the webview renders from the Dolt DB
+    // (`bd export` to stdout) instead of the issues.jsonl file. Default on in
+    // bd mode; per-project jsonl-priority flips it off (escape hatch).
+    bool renderFromBd_ = false;
+    bool bcInFlight_ = false;   // one dolt-export broadcast at a time
+    bool bcPending_ = false;    // coalesce broadcasts that arrive mid-flight
 
     std::shared_ptr<BeadsProject> project_;
     std::set<std::string> seenFilePaths_;

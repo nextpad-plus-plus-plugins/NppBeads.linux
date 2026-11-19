@@ -5,6 +5,7 @@
 #include "JsonlDataSource.h"
 #include "BdCommandRunner.h"
 #include "BdDataSource.h"
+#include "BdEventsTail.h"
 #include <glib.h>
 #include <cstdio>
 
@@ -31,12 +32,40 @@ static void testScanner(const char *root) {
 static void testJsonl(const char *root) {
     JsonlDataSource ds;
     ds.bindToPath(std::string(root) + "/proj/.beads/issues.jsonl");
+    // The fixture carries 3 issue rows PLUS a bd-1.3 "_type":"memory" record
+    // and an id-less issue record — both must be filtered out (19ddebc).
     CHECK("jsonl.count", ds.issueCount() == 3);
     CHECK("jsonl.open", ds.openIssueCount() == 1);
     CHECK("jsonl.blocked", ds.blockedIssueCount() == 1);
     CHECK("jsonl.closed", ds.closedIssueCount() == 1);
     CHECK("jsonl.rawnonempty", !ds.rawText().empty());
     CHECK("jsonl.readonly", !ds.writable());
+
+    // adoptRawText + fedExternally (20c5103): adopted text becomes the truth,
+    // reload() no-ops until the flag clears.
+    ds.setFedExternally(true);
+    ds.adoptRawText("{\"id\":\"bd-x\",\"status\":\"open\"}\n"
+                    "{\"id\":\"bd-y\",\"status\":\"open\"}\n"
+                    "{\"_type\":\"memory\",\"key\":\"k\"}\n");
+    CHECK("adopt.count", ds.issueCount() == 2);
+    CHECK("adopt.open", ds.openIssueCount() == 2);
+    ds.reload();   // must NOT re-read the file while fed externally
+    CHECK("adopt.reloadnoop", ds.issueCount() == 2);
+    ds.setFedExternally(false);
+    ds.reload();   // back to the file as the truth
+    CHECK("adopt.backtofile", ds.issueCount() == 3);
+}
+
+static void testScannerDoltOnly(const char *root) {
+    // A .beads/ with only an embeddeddolt/ dir (bd 1.3 default: no jsonl
+    // until an explicit export) must be usable, with jsonlPath pre-set to
+    // the EXPECTED export target.
+    std::string beads = std::string(root) + "/doltproj/.beads";
+    g_mkdir_with_parents((beads + "/embeddeddolt").c_str(), 0755);
+    CHECK("scanner.dolt.usable", BeadsProjectScanner::isUsableBeadsDir(beads));
+    auto p = BeadsProjectScanner::projectFromBeadsDir(beads);
+    CHECK("scanner.dolt.project", p != nullptr);
+    if (p) CHECK("scanner.dolt.jsonlpath", p->jsonlPath == beads + "/issues.jsonl");
 }
 
 static void testClassification() {
@@ -67,9 +96,9 @@ struct AsyncState { GMainLoop *loop; std::shared_ptr<BdCommandRunner> runner; in
 static void asyncNext(AsyncState *st);
 
 static void testRunnerAsync(const char *root, const char *fakeBinDir) {
-    // Put the fake bd first on PATH so resolveBdBinary picks it up.
-    std::string path = std::string(fakeBinDir) + ":" + (g_getenv("PATH") ? g_getenv("PATH") : "");
-    g_setenv("PATH", path.c_str(), TRUE);
+    // Point the resolver at the stub bd (beats any real install).
+    std::string stub = std::string(fakeBinDir) + "/bd";
+    g_setenv("NPPBEADS_BD", stub.c_str(), TRUE);
 
     auto *st = new AsyncState;
     st->loop = g_main_loop_new(nullptr, FALSE);
@@ -113,21 +142,123 @@ static void asyncNext(AsyncState *st) {
             CHECK("runner.close.blockers", blk.size() == 2);
             asyncNext(st);
         });
-    } else {
+    } else if (st->step == 3) {
+        st->step = 4;
         // Also exercise BdDataSource error mapping over the same runner.
         BdDataSource *bd = new BdDataSource(st->runner);
         bd->closeIssue("bd-x", nullptr, false, [st, bd](JsonNode *, const BeadsError &err) {
             CHECK("bdds.close.blocked", err.code == BeadsErrBlockedByDeps);
             CHECK("bdds.close.blockers", err.blockers.size() == 2);
             delete bd;
-            g_main_loop_quit(st->loop);
+            asyncNext(st);
         });
+    } else if (st->step == 4) {
+        st->step = 5;
+        // bd 1.3 compat: `update --unassign` answers "unknown flag" — the
+        // runner must fall back to `assign <id> ""` and succeed (d701f4f).
+        st->runner->unassignIssue("bd-a", [st](const BdResultPtr &res) {
+            CHECK("runner.unassign.fallback", res->ok);
+            CHECK("runner.unassign.viaassign",
+                  !res->argv.empty() && res->argv[0] == "assign");
+            asyncNext(st);
+        });
+    } else if (st->step == 5) {
+        st->step = 6;
+        // bd 1.0.2 comment interface: `comment <id> --stdin` with the body
+        // piped — multi-line + special chars must round-trip (f0aa9c9).
+        std::string body = "line one\nline `two` with \"quotes\" and $vars";
+        st->runner->addComment("bd-a", body, [st, body](const BdResultPtr &res) {
+            CHECK("runner.comment.ok", res->ok);
+            bool match = false;
+            if (res->json && JSON_NODE_HOLDS_OBJECT(res->json)) {
+                JsonObject *o = json_node_get_object(res->json);
+                const char *c = json_object_has_member(o, "comment")
+                    ? json_object_get_string_member(o, "comment") : nullptr;
+                match = c && body == c;
+            }
+            CHECK("runner.comment.roundtrip", match);
+            asyncNext(st);
+        });
+    } else if (st->step == 6) {
+        st->step = 7;
+        // show: `--include-comments` answers "unknown flag" on the stub —
+        // must fall back to the plain form and still unwrap the array.
+        st->runner->showIssue("bd-q", [st](const BdResultPtr &res) {
+            CHECK("runner.show.fallback", res->ok);
+            bool hasTitle = false;
+            if (res->json && JSON_NODE_HOLDS_OBJECT(res->json)) {
+                JsonObject *o = json_node_get_object(res->json);
+                hasTitle = json_object_has_member(o, "title");
+            }
+            CHECK("runner.show.object", hasTitle);
+            asyncNext(st);
+        });
+    } else if (st->step == 7) {
+        st->step = 8;
+        // Dolt render: `bd export --all` to stdout (20c5103).
+        CHECK("runner.eventsgate", st->runner->supportsEventsFeed());   // 9.9.9
+        st->runner->exportAllJsonl([st](const BdResultPtr &res) {
+            CHECK("runner.export.ok", res->ok);
+            CHECK("runner.export.text",
+                  res->rawStdout.find("bd-d") != std::string::npos);
+            asyncNext(st);
+        });
+    } else if (st->step == 8) {
+        st->step = 9;
+        // Events tail (5fa21c2): two records -> ONE coalesced onChange with
+        // lastSeq at the highest record seq.
+        g_setenv("BD_STUB_EVENTS", "ok", TRUE);
+        auto *tail = new BdEventsTail(st->runner->bdPath(),
+                                      st->runner->projectDir());
+        tail->setSinceSeq(40);
+        // NB: onChange is invoked through the tail's own std::function member,
+        // so deleting the tail inside it would free the running closure (and
+        // its captures). Defer the delete one loop tick.
+        auto deferDelete = [](BdEventsTail *t) {
+            g_idle_add([](gpointer p) -> gboolean {
+                auto *t = static_cast<BdEventsTail *>(p);
+                t->stop(); delete t; return G_SOURCE_REMOVE;
+            }, t);
+        };
+        tail->onChange = [st, tail, deferDelete]() {
+            AsyncState *state = st;   // locals survive the deferred delete
+            CHECK("tail.records", tail->recordCount() == 2);
+            CHECK("tail.lastseq", tail->lastSeq() == 42);
+            deferDelete(tail);
+            asyncNext(state);
+        };
+        tail->onBroken = [st, tail, deferDelete](const std::string &reason) {
+            AsyncState *state = st;
+            g_printerr("FAIL tail.unexpectedbreak (%s)\n", reason.c_str());
+            g_fail = 1;
+            deferDelete(tail);
+            asyncNext(state);
+        };
+        tail->start();
+    } else if (st->step == 9) {
+        st->step = 10;
+        // Journal disabled: bd says so on stdout and exits — onBroken must
+        // fire exactly once so the owner can fall back to polling.
+        g_setenv("BD_STUB_EVENTS", "disabled", TRUE);
+        auto *tail = new BdEventsTail(st->runner->bdPath(),
+                                      st->runner->projectDir());
+        tail->onChange = [] { g_printerr("FAIL tail2.unexpectedchange\n"); g_fail = 1; };
+        tail->onBroken = [st, tail](const std::string &reason) {
+            CHECK("tail2.brokenreason",
+                  reason.find("journal is disabled") != std::string::npos);
+            delete tail;
+            asyncNext(st);
+        };
+        tail->start();
+    } else {
+        g_main_loop_quit(st->loop);
     }
 }
 
 int main(int argc, char **argv) {
     if (argc < 3) { g_printerr("usage: %s <root> <fakeBinDir>\n", argv[0]); return 2; }
     testScanner(argv[1]);
+    testScannerDoltOnly(argv[1]);
     testJsonl(argv[1]);
     testClassification();
     testRunnerAsync(argv[1], argv[2]);

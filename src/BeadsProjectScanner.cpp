@@ -11,8 +11,13 @@ bool isUsableBeadsDir(const std::string &beadsDir) {
     if (!g_file_test(beadsDir.c_str(), G_FILE_TEST_IS_DIR)) return false;
     std::string jsonl = beadsDir + "/issues.jsonl";
     std::string db    = beadsDir + "/beads.db";
+    // bd >= 1.x keeps the real data in an embedded Dolt directory and (since
+    // bd 1.3) only writes issues.jsonl on explicit export — a Dolt-only
+    // workspace is fully usable through the bd backend.
+    std::string dolt  = beadsDir + "/embeddeddolt";
     return g_file_test(jsonl.c_str(), G_FILE_TEST_EXISTS) ||
-           g_file_test(db.c_str(), G_FILE_TEST_EXISTS);
+           g_file_test(db.c_str(), G_FILE_TEST_EXISTS) ||
+           g_file_test(dolt.c_str(), G_FILE_TEST_IS_DIR);
 }
 
 static std::shared_ptr<BeadsProject> makeProject(const std::string &beadsDir,
@@ -20,10 +25,12 @@ static std::shared_ptr<BeadsProject> makeProject(const std::string &beadsDir,
     auto p = std::make_shared<BeadsProject>();
     p->beadsDir = beadsDir;
     p->projectRoot = root;
-    std::string jsonl = beadsDir + "/issues.jsonl";
-    std::string db    = beadsDir + "/beads.db";
-    if (g_file_test(jsonl.c_str(), G_FILE_TEST_EXISTS)) p->jsonlPath = jsonl;
-    if (g_file_test(db.c_str(), G_FILE_TEST_EXISTS))    p->dbPath    = db;
+    // jsonlPath is the EXPECTED location (bd export target) even when the
+    // file doesn't exist yet — Dolt-only workspaces create it on the first
+    // export, and consumers tolerate a missing file.
+    p->jsonlPath = beadsDir + "/issues.jsonl";
+    std::string db = beadsDir + "/beads.db";
+    if (g_file_test(db.c_str(), G_FILE_TEST_EXISTS)) p->dbPath = db;
     return p;
 }
 
