@@ -8,6 +8,12 @@ application hosting the identical panel.
 All viewer assets are bundled and served over a custom `nppbeads://` scheme;
 no external fetches for local projects, fully offline.
 
+![Beads panel](https://raw.githubusercontent.com/nextpad-plus-plus-plugins/NppBeads.macos/main/screenshot.png)
+*The Beads panel docked in the editor*
+
+![BeadsViewer standalone app](https://raw.githubusercontent.com/nextpad-plus-plus-plugins/NppBeads.macos/main/screenshot-app.png)
+*The standalone BeadsViewer app — open multiple windows to monitor multiple projects*
+
 ## What you get (v1.0.2)
 
 - **Five surfaces** — Dashboard, Insights (PageRank / Betweenness / Critical
