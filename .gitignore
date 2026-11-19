@@ -5,3 +5,4 @@ build-release/
 *.zip
 .DS_Store
 dist/
+build-pkg/
