@@ -6,8 +6,15 @@
 #include "BdCommandRunner.h"
 #include "BdDataSource.h"
 #include "BdEventsTail.h"
+#include "BeadsRecent.h"
+#include "RemoteJsonlFetcher.h"
 #include <glib.h>
+#include <libsoup/soup.h>
 #include <cstdio>
+#include <cstring>
+#include <csignal>
+#include <unistd.h>
+#include <sys/wait.h>
 
 static int g_fail = 0;
 #define CHECK(id, cond) do { if (!(cond)) { g_printerr("FAIL %s\n", id); g_fail = 1; } } while (0)
@@ -88,6 +95,87 @@ static void testClassification() {
     auto lk = std::make_shared<BdResult>();
     lk->ok = false; lk->rawStderr = "database is locked";
     CHECK("class.locked", lk->errorKind() == BdErrLocked);
+}
+
+// ── spec parsing (RemoteJsonlFetcher, macOS nppmac-0th/iik parity) ──────────
+static void testSpecParsing() {
+    std::string d;
+    CHECK("spec.gh.short", RemoteJsonlFetcher::specForInput("owner/repo", "", &d)
+          == "github.com/owner/repo@main");
+    CHECK("spec.gh.disp", d == "owner/repo @ main");
+    CHECK("spec.gh.url", RemoteJsonlFetcher::specForInput(
+          "https://github.com/o/r.git", "dev", &d) == "github.com/o/r@dev");
+    CHECK("spec.gh.www", RemoteJsonlFetcher::specForInput(
+          "www.github.com/o/r/", "", &d) == "github.com/o/r@main");
+    // Self-hosted forge repo-page URL derives the Gitea/Forgejo raw layout.
+    CHECK("spec.gitea", RemoteJsonlFetcher::specForInput(
+          "http://192.168.1.6:3021/nextpad-plus-plus/nextpad-plus-plus-linux", "", &d)
+          == "http://192.168.1.6:3021/nextpad-plus-plus/nextpad-plus-plus-linux"
+             "/raw/branch/main/.beads/issues.jsonl");
+    CHECK("spec.gitea.disp",
+          d == "192.168.1.6:3021/nextpad-plus-plus/nextpad-plus-plus-linux @ main");
+    // Direct raw URL passes through unchanged (more than two path parts).
+    const char *raw = "https://host/x/raw/branch/main/.beads/issues.jsonl";
+    CHECK("spec.direct", RemoteJsonlFetcher::specForInput(raw, "", &d) == raw);
+    CHECK("spec.invalid", RemoteJsonlFetcher::specForInput("foo", "", &d).empty());
+    CHECK("spec.empty", RemoteJsonlFetcher::specForInput("  ", "", &d).empty());
+}
+
+// ── per-project persistence additions (auto-push, remotes MRU, tail pid) ────
+static void testRecentKeys() {
+    const std::string root = "/tmp/selftest-proj-x";
+    CHECK("recent.autopush.default", !BeadsRecent::autoPushFor(root));
+    BeadsRecent::setAutoPush(root, true);
+    CHECK("recent.autopush.on", BeadsRecent::autoPushFor(root));
+    BeadsRecent::setAutoPush(root, false);
+    CHECK("recent.autopush.off", !BeadsRecent::autoPushFor(root));
+
+    BeadsRecent::setEventsPid(root, 4242, 77);
+    int rec = 0;
+    CHECK("recent.pid", BeadsRecent::eventsPidFor(root, &rec) == 4242);
+    CHECK("recent.pid.recorder", rec == 77);
+
+    BeadsRecent::pushRemote("specA", "A");
+    BeadsRecent::pushRemote("specB", "B");
+    BeadsRecent::pushRemote("specA", "A2");   // dedupe + move to front
+    auto remotes = BeadsRecent::loadRemotes();
+    CHECK("recent.remotes.count", remotes.size() == 2);
+    CHECK("recent.remotes.front",
+          remotes.size() == 2 && remotes[0].spec == "specA" &&
+          remotes[0].display == "A2" && remotes[1].spec == "specB");
+}
+
+// ── orphan sweep helper: double-fork a detached stub tail. The middle child
+// exits (and is reaped) — its pid becomes the DEAD RECORDER the sweep keys
+// on; the grandchild is the orphaned tail.
+struct OrphanPair { pid_t tail = 0; pid_t deadRecorder = 0; };
+static OrphanPair spawnOrphanTail(const std::string &bd, const std::string &cwd) {
+    OrphanPair out;
+    int fds[2];
+    if (pipe(fds)) return out;
+    pid_t c = fork();
+    if (c == 0) {
+        pid_t g = fork();
+        if (g == 0) {
+            close(fds[0]); close(fds[1]);
+            if (chdir(cwd.c_str()) != 0) _exit(127);
+            setenv("BD_STUB_EVENTS", "ok", 1);
+            execl(bd.c_str(), bd.c_str(), "events", "tail", "--since=0",
+                  "--follow", (char *)nullptr);
+            _exit(127);
+        }
+        ssize_t n = write(fds[1], &g, sizeof g);
+        (void)n;
+        _exit(0);
+    }
+    close(fds[1]);
+    pid_t g = 0;
+    ssize_t n = read(fds[0], &g, sizeof g);
+    close(fds[0]);
+    waitpid(c, nullptr, 0);   // middle child reaped → guaranteed-dead recorder
+    out.tail = (n == (ssize_t)sizeof g) ? g : 0;
+    out.deadRecorder = c;
+    return out;
 }
 
 // ── async runner test against a fake `bd` on PATH ───────────────────────────
@@ -250,6 +338,123 @@ static void asyncNext(AsyncState *st) {
             asyncNext(st);
         };
         tail->start();
+    } else if (st->step == 10) {
+        st->step = 11;
+        // Orphan sweep (macOS nppmac-8n1): a detached previous-run tail with
+        // ppid 1 and a bd events-tail cmdline must be reaped by the next
+        // start() for the same project.
+        g_setenv("BD_STUB_EVENTS", "ok", TRUE);
+        OrphanPair orphan = spawnOrphanTail(st->runner->bdPath(), st->runner->projectDir());
+        CHECK("sweep.spawned", orphan.tail > 1);
+        CHECK("sweep.alive", orphan.tail > 1 && kill(orphan.tail, 0) == 0);
+        // Record the orphan under a DEAD recorder (the reaped middle child),
+        // then start a fresh tail — its start() runs the sweep.
+        BeadsRecent::setEventsPid(st->runner->projectDir(),
+                                  (int)orphan.tail, (int)orphan.deadRecorder);
+        struct SweepCtx { AsyncState *st; pid_t orphan; int ticks = 0; BdEventsTail *tail = nullptr; };
+        auto *sc = new SweepCtx{st, orphan.tail};
+        sc->tail = new BdEventsTail(st->runner->bdPath(), st->runner->projectDir());
+        sc->tail->onChange = [] {};
+        sc->tail->onBroken = [](const std::string &) {};
+        sc->tail->start();
+        g_timeout_add(100, +[](gpointer u) -> gboolean {
+            auto *sc = static_cast<SweepCtx *>(u);
+            // Phase 2: the orphan must be gone (SIGTERM delivered by the sweep).
+            if (kill(sc->orphan, 0) == 0 && ++sc->ticks < 20) return G_SOURCE_CONTINUE;
+            CHECK("sweep.reaped", kill(sc->orphan, 0) != 0);
+            BdEventsTail *t = sc->tail;
+            g_idle_add(+[](gpointer p) -> gboolean {
+                auto *t = static_cast<BdEventsTail *>(p);
+                t->stop(); delete t; return G_SOURCE_REMOVE;
+            }, t);
+            AsyncState *state = sc->st;
+            delete sc;
+            asyncNext(state);
+            return G_SOURCE_REMOVE;
+        }, sc);
+    } else if (st->step == 11) {
+        st->step = 12;
+        // Remote fetch e2e against an in-process SoupServer: Gitea-style
+        // derived raw path, 200 → onText, unchanged body + no ETag → length
+        // gate suppresses a second onText, 404 → onError.
+        static const char *kBody = "{\"id\":\"r-1\",\"status\":\"open\"}\n"
+                                   "{\"id\":\"r-2\",\"status\":\"closed\"}\n";
+        SoupServer *srv = soup_server_new(nullptr);
+        soup_server_add_handler(srv, "/own/repo/raw/branch/main/.beads/issues.jsonl",
+            +[](SoupServer *, SoupServerMessage *msg, const char *, GHashTable *, gpointer) {
+                soup_server_message_set_status(msg, 200, nullptr);
+                soup_server_message_set_response(msg, "application/octet-stream",
+                    SOUP_MEMORY_STATIC, kBody, strlen(kBody));
+            }, nullptr, nullptr);
+        GError *err = nullptr;
+        if (!soup_server_listen_local(srv, 0, (SoupServerListenOptions)0, &err)) {
+            g_printerr("FAIL remote.listen (%s)\n", err ? err->message : "?");
+            g_fail = 1;
+            if (err) g_error_free(err);
+            asyncNext(st);
+            return;
+        }
+        GSList *uris = soup_server_get_uris(srv);
+        int port = uris ? g_uri_get_port((GUri *)uris->data) : 0;
+        g_slist_free_full(uris, (GDestroyNotify)g_uri_unref);
+        char base[96];
+        g_snprintf(base, sizeof base, "http://127.0.0.1:%d/own/repo", port);
+        std::string display;
+        std::string spec = RemoteJsonlFetcher::specForInput(base, "", &display);
+        CHECK("remote.derive", spec.find("/raw/branch/main/.beads/issues.jsonl")
+                               != std::string::npos);
+        struct RemoteCtx { AsyncState *st; SoupServer *srv;
+                           RemoteJsonlFetcher *f = nullptr, *bad = nullptr;
+                           int texts = 0; bool gotErr = false; };
+        auto *rc = new RemoteCtx{st, srv};
+        rc->f = new RemoteJsonlFetcher(spec, "");
+        rc->f->onText = [rc](const std::string &jsonl) {
+            rc->texts++;
+            if (rc->texts == 1) {
+                CHECK("remote.body", jsonl.find("r-2") != std::string::npos);
+                rc->f->kick();   // same body, no ETag → length gate, no 2nd onText
+                g_timeout_add(400, +[](gpointer u) -> gboolean {
+                    auto *rc = static_cast<RemoteCtx *>(u);
+                    CHECK("remote.lengthgate", rc->texts == 1);
+                    // 404 path: derived URL for a repo the server doesn't serve.
+                    GSList *uris2 = soup_server_get_uris(rc->srv);
+                    int port2 = uris2 ? g_uri_get_port((GUri *)uris2->data) : 0;
+                    g_slist_free_full(uris2, (GDestroyNotify)g_uri_unref);
+                    char miss[96];
+                    g_snprintf(miss, sizeof miss,
+                               "http://127.0.0.1:%d/no/such", port2);
+                    std::string d2;
+                    std::string missSpec =
+                        RemoteJsonlFetcher::specForInput(miss, "", &d2);
+                    rc->bad = new RemoteJsonlFetcher(missSpec, "");
+                    rc->bad->onError = [rc](const std::string &m) {
+                        if (rc->gotErr) return;
+                        rc->gotErr = true;
+                        CHECK("remote.404", m.find("404") != std::string::npos);
+                        g_idle_add(+[](gpointer u2) -> gboolean {
+                            auto *rc = static_cast<RemoteCtx *>(u2);
+                            rc->f->stop(); delete rc->f;
+                            rc->bad->stop(); delete rc->bad;
+                            soup_server_disconnect(rc->srv);
+                            g_object_unref(rc->srv);
+                            AsyncState *state = rc->st;
+                            delete rc;
+                            asyncNext(state);
+                            return G_SOURCE_REMOVE;
+                        }, rc);
+                    };
+                    rc->bad->onText = [](const std::string &) {
+                        g_printerr("FAIL remote.404.text\n"); g_fail = 1;
+                    };
+                    rc->bad->start();
+                    return G_SOURCE_REMOVE;
+                }, rc);
+            }
+        };
+        rc->f->onError = [](const std::string &m) {
+            g_printerr("FAIL remote.fetch (%s)\n", m.c_str()); g_fail = 1;
+        };
+        rc->f->start();
     } else {
         g_main_loop_quit(st->loop);
     }
@@ -257,10 +462,17 @@ static void asyncNext(AsyncState *st) {
 
 int main(int argc, char **argv) {
     if (argc < 3) { g_printerr("usage: %s <root> <fakeBinDir>\n", argv[0]); return 2; }
+    // Isolate the per-project settings ini (BeadsRecent) — the tail's orphan
+    // sweep and the key tests must never touch the real user config.
+    std::string xdg = std::string(argv[1]) + "/xdgconfig";
+    g_mkdir_with_parents(xdg.c_str(), 0755);
+    g_setenv("XDG_CONFIG_HOME", xdg.c_str(), TRUE);
     testScanner(argv[1]);
     testScannerDoltOnly(argv[1]);
     testJsonl(argv[1]);
     testClassification();
+    testSpecParsing();
+    testRecentKeys();
     testRunnerAsync(argv[1], argv[2]);
     if (!g_fail) g_print("beads_selftest: PASS\n");
     return g_fail;

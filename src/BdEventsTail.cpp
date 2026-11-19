@@ -7,8 +7,59 @@
 // restart must silence the previous child's stale reads.
 
 #include "BdEventsTail.h"
+#include "BeadsRecent.h"
 #include "beads_types.h"
 #include <cstring>
+#include <csignal>
+#include <cstdlib>
+#include <sys/types.h>
+#include <unistd.h>
+
+// ── Orphan sweep (macOS nppmac-8n1, Linux analogue) ─────────────────────────
+// A crash / SIGKILL of the host leaves the `bd events tail --follow` child
+// running forever (it polls the workspace DB and holds gate locks). Each
+// spawn records its child pid per project (BeadsRecent); the NEXT spawn for
+// the same project reaps the previous pid ONLY when all three hold:
+//   1. it is alive,
+//   2. the host process that RECORDED it is dead (macOS can test
+//      ppid == launchd; on Linux an orphan re-parents to the NEAREST
+//      SUBREAPER — systemd --user, a sandbox supervisor, anything — so the
+//      ppid carries no signal. A dead recorder proves the child lost its
+//      owner; a live sibling host's healthy tailer has a live recorder and
+//      is never touched. Recorder pid reuse fails safe: we skip the reap),
+//   3. its command line still is a bd/beads "events tail" invocation —
+//      recycled child pids fail this (checked via /proc/<pid>/cmdline,
+//      which also covers wrapper scripts where /proc/<pid>/exe would be
+//      the interpreter).
+static bool isOrphanedBdTail(pid_t pid, pid_t recorder) {
+    if (pid <= 1 || kill(pid, 0) != 0) return false;
+    if (recorder <= 1 || kill(recorder, 0) == 0) return false;
+
+    gchar *cmdline = nullptr;
+    gsize len = 0;
+    gchar *cmdPath = g_strdup_printf("/proc/%d/cmdline", (int)pid);
+    bool matches = false;
+    if (g_file_get_contents(cmdPath, &cmdline, &len, nullptr) && len > 0) {
+        // SOME argv entry's basename must be bd/beads-ish (argv[0] for the
+        // real binary; argv[1] when bd is a wrapper script and argv[0] is the
+        // interpreter), and "events" + "tail" must both appear as argv
+        // entries.
+        bool bdish = false, hasEvents = false, hasTail = false;
+        for (gsize i = 0; i + 1 < len; i += strlen(cmdline + i) + 1) {
+            const char *arg = cmdline + i;
+            gchar *base = g_path_get_basename(arg);
+            if (g_str_has_prefix(base, "bd") || g_str_has_prefix(base, "beads"))
+                bdish = true;
+            g_free(base);
+            if (!strcmp(arg, "events")) hasEvents = true;
+            if (!strcmp(arg, "tail"))   hasTail = true;
+        }
+        matches = bdish && hasEvents && hasTail;
+    }
+    g_free(cmdline);
+    g_free(cmdPath);
+    return matches;
+}
 
 struct TailCtx {
     std::weak_ptr<int> alive;
@@ -28,6 +79,16 @@ void BdEventsTail::start() {
     brokenFired_ = false;
     restartCount_ = 0;
     if (lastSeq_ < sinceSeq_) lastSeq_ = sinceSeq_;
+    // Crash/force-quit sweep: reap a previous run's orphaned child before
+    // spawning a sibling (see isOrphanedBdTail above for the guards).
+    int recorder = 0;
+    if (pid_t prev = (pid_t)BeadsRecent::eventsPidFor(projectDir_, &recorder)) {
+        if (isOrphanedBdTail(prev, (pid_t)recorder)) {
+            g_message("[NppBeads] reaping orphaned events tail from a "
+                      "previous run (pid=%d)", (int)prev);
+            kill(prev, SIGTERM);
+        }
+    }
     spawn();
 }
 
@@ -80,6 +141,11 @@ void BdEventsTail::spawn() {
         return;
     }
     proc_ = proc;
+    // Record the child for the next run's orphan sweep. Deliberately NOT
+    // cleared on clean stop (the guards reject a dead/recycled pid), so a
+    // terminate between stop() and relaunch is still covered.
+    if (const char *ident = g_subprocess_get_identifier(proc))
+        BeadsRecent::setEventsPid(projectDir_, atoi(ident), (int)getpid());
     unsigned gen = ++spawnGen_;
     stderrTail_.clear();
 

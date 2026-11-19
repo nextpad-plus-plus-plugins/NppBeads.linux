@@ -38,4 +38,26 @@ void setEventsSeq(const std::string &root, unsigned long long seq);
 bool jsonlPriorityFor(const std::string &root);
 void setJsonlPriority(const std::string &root, bool enabled);
 
+// Per-project bd auto-push opt-in (macOS NppBeadsAutoPushProjects). Absent /
+// false = sandbox ON (bd gets --sandbox, Dolt auto-push disabled — default).
+bool autoPushFor(const std::string &root);
+void setAutoPush(const std::string &root, bool enabled);
+
+// Last spawned `bd events tail` child pid for this project + the pid of the
+// host process that recorded it (macOS nppmac-8n1 orphan sweep, Linux
+// shape). Deliberately NOT cleared on clean stop — the next start() reaps
+// the child only when it is alive, its RECORDER is dead (orphans re-parent
+// to an arbitrary subreaper on Linux, so ppid tells nothing) and its
+// command line still is a bd events-tail invocation; stale values are
+// harmless.
+int eventsPidFor(const std::string &root, int *recorderOut);
+void setEventsPid(const std::string &root, int pid, int recorderPid);
+
+// ── Recent REMOTE connections (macOS NppBeadsRecentRemotes): {spec, display}
+// pairs, MRU-first, deduped by spec, capped. Specs only — tokens NEVER land
+// here (they live in the Secret Service keyring).
+struct RemoteEntry { std::string spec; std::string display; };
+std::vector<RemoteEntry> loadRemotes();
+void pushRemote(const std::string &spec, const std::string &display);
+
 }  // namespace BeadsRecent

@@ -6,6 +6,17 @@
 
 namespace BeadsProjectScanner {
 
+std::shared_ptr<BeadsProject> remoteProject(const std::string &spec,
+                                            const std::string &display) {
+    if (spec.empty()) return nullptr;
+    auto p = std::make_shared<BeadsProject>();
+    p->beadsDir      = spec;
+    p->projectRoot   = spec;
+    p->remoteSpec    = spec;
+    p->remoteDisplay = display.empty() ? spec : display;
+    return p;
+}
+
 bool isUsableBeadsDir(const std::string &beadsDir) {
     if (beadsDir.empty()) return false;
     if (!g_file_test(beadsDir.c_str(), G_FILE_TEST_IS_DIR)) return false;

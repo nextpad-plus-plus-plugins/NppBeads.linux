@@ -92,7 +92,7 @@ BeadsPanel::BeadsPanel(const std::string &resourcesDir) : resourcesDir_(resource
     ds_ = std::make_shared<JsonlDataSource>();
     activeDataSource_ = ds_.get();
     watcher_ = std::make_unique<BeadsWatcher>();
-    watcher_->onChange = [this]() { reloadData(); };
+    watcher_->onChange = [this]() { watcherFireCount_++; reloadData(); };
     buildUI();
     loadViewer();
     refreshStatusBar();
@@ -101,6 +101,7 @@ BeadsPanel::BeadsPanel(const std::string &resourcesDir) : resourcesDir_(resource
 BeadsPanel::~BeadsPanel() {
     if (poll_) poll_->stop();
     if (tail_) tail_->stop();
+    if (remote_) remote_->stop();
     watcher_->stop();
     // root_ is owned by the host once docked; do not destroy it here.
 }
@@ -188,6 +189,40 @@ GtkWidget *BeadsPanel::makeToolbar() {
         }), this);
     g_action_map_add_action(G_ACTION_MAP(ag), G_ACTION(exportAction_));
     g_object_unref(exportAction_);
+    // "Switch project…" (dot menu) → pop the chip's switcher. Deferred to an
+    // idle so the dot popover finishes closing before the chip one opens.
+    addAct("switchproject", G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer s){
+        auto *p = static_cast<BeadsPanel*>(s);
+        g_idle_add(+[](gpointer u) -> gboolean {
+            gtk_menu_button_popup(GTK_MENU_BUTTON(u));
+            return G_SOURCE_REMOVE;
+        }, p->projectChip_);
+    }));
+    addAct("revealjsonl",  G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer s){ static_cast<BeadsPanel*>(s)->revealJsonl(); }));
+    addAct("diagnostics",  G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer s){ static_cast<BeadsPanel*>(s)->copyDiagnostics(); }));
+    addAct("jsonlhead",    G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer s){ static_cast<BeadsPanel*>(s)->showJsonlHead(); }));
+    addAct("connectremote",G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer s){ static_cast<BeadsPanel*>(s)->connectRemoteDialog(); }));
+    // Parameterized: pick a recent remote connection ("spec\x1fdisplay").
+    GSimpleAction *pickr = g_simple_action_new("pickremote", G_VARIANT_TYPE_STRING);
+    g_signal_connect(pickr, "activate",
+        G_CALLBACK(+[](GSimpleAction *, GVariant *param, gpointer s){
+            const char *v = g_variant_get_string(param, nullptr);
+            const char *sep = v ? strchr(v, '\x1f') : nullptr;
+            if (!sep) return;
+            static_cast<BeadsPanel*>(s)->pickRemote(std::string(v, sep - v), sep + 1);
+        }), this);
+    g_action_map_add_action(G_ACTION_MAP(ag), G_ACTION(pickr));
+    g_object_unref(pickr);
+    // Per-project bd auto-push opt-in — stateful bool (GMenu checkmark).
+    autoPushAction_ = g_simple_action_new_stateful("autopush", nullptr,
+                                                   g_variant_new_boolean(FALSE));
+    g_simple_action_set_enabled(autoPushAction_, FALSE);
+    g_signal_connect(autoPushAction_, "activate",
+        G_CALLBACK(+[](GSimpleAction *, GVariant *, gpointer s){
+            static_cast<BeadsPanel*>(s)->toggleAutoPush();
+        }), this);
+    g_action_map_add_action(G_ACTION_MAP(ag), G_ACTION(autoPushAction_));
+    g_object_unref(autoPushAction_);
     gtk_widget_insert_action_group(root_, "beads", G_ACTION_GROUP(ag));
     g_object_unref(ag);
 
@@ -228,7 +263,99 @@ GtkWidget *BeadsPanel::makeToolbar() {
     g_signal_connect(themeBtn_, "clicked", G_CALLBACK(s_themeClicked), this);
     gtk_box_append(GTK_BOX(row), themeBtn_);
 
+    // Reveal .beads/ (macOS folder title-bar button). Handler no-ops with no
+    // project, like the macOS validation.
+    folderBtn_ = gtk_button_new_from_icon_name("folder-symbolic");
+    gtk_widget_set_tooltip_text(folderBtn_, "Reveal .beads/ folder");
+    g_signal_connect(folderBtn_, "clicked",
+        G_CALLBACK(+[](GtkButton *, gpointer s){ static_cast<BeadsPanel*>(s)->openBeadsDir(); }),
+        this);
+    gtk_box_append(GTK_BOX(row), folderBtn_);
+
+    // "More actions" overflow (macOS ellipsis.circle). Model rebuilt on every
+    // popover map so the auto-push checkmark / bd-only sections are fresh.
+    dotBtn_ = gtk_menu_button_new();
+    gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(dotBtn_), "view-more-symbolic");
+    gtk_widget_set_tooltip_text(dotBtn_, "More actions");
+    dotMenu_ = g_menu_new();
+    gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(dotBtn_), G_MENU_MODEL(dotMenu_));
+    rebuildDotMenu();
+    if (GtkPopover *pop = gtk_menu_button_get_popover(GTK_MENU_BUTTON(dotBtn_))) {
+        g_signal_connect(pop, "map", G_CALLBACK(+[](GtkWidget *, gpointer s){
+            static_cast<BeadsPanel*>(s)->rebuildDotMenu();
+        }), this);
+    }
+    gtk_box_append(GTK_BOX(row), dotBtn_);
+
     return row;
+}
+
+// "More actions" menu — mirrors the macOS overflow/context menu item-for-item
+// (Switch project / reloads / reveals / Data Source / auto-push /
+// diagnostics), minus macOS-only phrasing. File-system entries and bd-scoped
+// sections drop out for remote connections.
+void BeadsPanel::rebuildDotMenu() {
+    bool bdActive = bdDataSource_ && activeDataSource_ == bdDataSource_.get();
+    bool remote = project_ && project_->isRemote();
+    std::string sig = std::string(project_ ? "P" : "-") +
+                      (remote ? "R" : "-") + (bdActive ? "B" : "-");
+    if (sig == dotMenuSig_) return;
+    dotMenuSig_ = sig;
+
+    g_menu_remove_all(dotMenu_);
+
+    {
+        GMenu *sec = g_menu_new();
+        g_menu_append(sec, "Switch project…", "beads.switchproject");
+        g_menu_append_section(dotMenu_, nullptr, G_MENU_MODEL(sec));
+        g_object_unref(sec);
+    }
+    {
+        GMenu *sec = g_menu_new();
+        g_menu_append(sec, "Reload issues from disk", "beads.reload");
+        g_menu_append(sec, "Reload viewer", "beads.reloadviewer");
+        g_menu_append_section(dotMenu_, nullptr, G_MENU_MODEL(sec));
+        g_object_unref(sec);
+    }
+    if (project_ && !remote) {
+        GMenu *sec = g_menu_new();
+        g_menu_append(sec, "Reveal issues.jsonl…", "beads.revealjsonl");
+        g_menu_append(sec, "Open .beads/ folder", "beads.reveal");
+        g_menu_append_section(dotMenu_, nullptr, G_MENU_MODEL(sec));
+        g_object_unref(sec);
+    }
+    if (bdActive) {
+        GMenu *sec = g_menu_new();
+        GMenu *srcMenu = g_menu_new();
+        GMenuItem *dolt = g_menu_item_new("Prefer local Dolt DB (live via bd)", nullptr);
+        g_menu_item_set_action_and_target_value(dolt, "beads.datasrc",
+            g_variant_new_string("dolt"));
+        g_menu_append_item(srcMenu, dolt);
+        g_object_unref(dolt);
+        GMenuItem *jsonl = g_menu_item_new("Prefer issues.jsonl (file on disk)", nullptr);
+        g_menu_item_set_action_and_target_value(jsonl, "beads.datasrc",
+            g_variant_new_string("jsonl"));
+        g_menu_append_item(srcMenu, jsonl);
+        g_object_unref(jsonl);
+        g_menu_append_submenu(sec, "Data Source", G_MENU_MODEL(srcMenu));
+        g_object_unref(srcMenu);
+        g_menu_append(sec, "Export issues.jsonl now (from Dolt)", "beads.exportnow");
+        g_menu_append_section(dotMenu_, nullptr, G_MENU_MODEL(sec));
+        g_object_unref(sec);
+    }
+    if (project_ && !remote) {
+        GMenu *sec = g_menu_new();
+        g_menu_append(sec, "Enable bd auto-push for this project", "beads.autopush");
+        g_menu_append_section(dotMenu_, nullptr, G_MENU_MODEL(sec));
+        g_object_unref(sec);
+    }
+    {
+        GMenu *sec = g_menu_new();
+        g_menu_append(sec, "Copy diagnostics to clipboard", "beads.diagnostics");
+        g_menu_append(sec, "Show raw JSONL head (first 1000 chars)", "beads.jsonlhead");
+        g_menu_append_section(dotMenu_, nullptr, G_MENU_MODEL(sec));
+        g_object_unref(sec);
+    }
 }
 
 // Mirrors macOS _buildProjectSwitcherMenu: current project (checked label) →
@@ -251,6 +378,7 @@ void BeadsPanel::rebuildProjectMenu() {
     bool bdActive = bdDataSource_ && activeDataSource_ == bdDataSource_.get();
     std::string sig = cur + "\x1e";
     for (auto &r : roots) { sig += r; sig += "\x1f"; }
+    for (auto &e : BeadsRecent::loadRemotes()) { sig += e.spec; sig += "\x1f"; }
     sig += project_ ? "P" : "-";
     sig += hideHandler_ ? "H" : "-";
     sig += bdActive ? "B" : "-";
@@ -263,7 +391,8 @@ void BeadsPanel::rebuildProjectMenu() {
     // renders it insensitive, like the macOS disabled state-on row).
     if (project_) {
         GMenu *sec = g_menu_new();
-        std::string label = "✓ " + pathLeaf(project_->projectRoot);
+        std::string label = "✓ " + (project_->isRemote()
+            ? project_->remoteDisplay : pathLeaf(project_->projectRoot));
         g_menu_append(sec, label.c_str(), "beads.__current");
         g_menu_append_section(projectMenu_, nullptr, G_MENU_MODEL(sec));
         g_object_unref(sec);
@@ -292,39 +421,33 @@ void BeadsPanel::rebuildProjectMenu() {
         g_object_unref(sec);
     }
 
-    // Panel utilities (macOS keeps these on the right-click context menu; the
-    // Linux chip menu is the single home for both). Project-scoped entries
-    // only appear when a project is bound.
+    // Recent REMOTE connections (🌐 section, macOS parity). Specs only —
+    // tokens stay in the keyring.
     {
+        auto remotes = BeadsRecent::loadRemotes();
+        std::string curSpec = (project_ && project_->isRemote())
+                              ? project_->remoteSpec : "";
         GMenu *sec = g_menu_new();
-        if (project_) {
-            g_menu_append(sec, "Reload issues from disk", "beads.reload");
-            g_menu_append(sec, "Reveal .beads/ folder",   "beads.reveal");
+        bool anyRemote = false;
+        for (auto &e : remotes) {
+            if (e.spec == curSpec) continue;
+            GMenuItem *item = g_menu_item_new(("🌐 " + e.display).c_str(), nullptr);
+            std::string packed = e.spec + '\x1f' + e.display;
+            g_menu_item_set_action_and_target_value(item, "beads.pickremote",
+                g_variant_new_string(packed.c_str()));
+            g_menu_append_item(sec, item);
+            g_object_unref(item);
+            anyRemote = true;
         }
-        g_menu_append(sec, "Reload viewer", "beads.reloadviewer");
-        g_menu_append_section(projectMenu_, nullptr, G_MENU_MODEL(sec));
+        if (anyRemote) g_menu_append_section(projectMenu_, nullptr, G_MENU_MODEL(sec));
         g_object_unref(sec);
     }
 
-    // Data-source priority (Dolt-live default · issues.jsonl escape hatch) +
-    // manual export — bd backend only (macOS keeps these on the context menu;
-    // the chip menu is the Linux home for both).
-    if (bdActive) {
+    // Connect to a remote repository (read-only monitoring) — always offered,
+    // like "Open .beads folder…".
+    {
         GMenu *sec = g_menu_new();
-        GMenu *srcMenu = g_menu_new();
-        GMenuItem *dolt = g_menu_item_new("Prefer local Dolt DB (live via bd)", nullptr);
-        g_menu_item_set_action_and_target_value(dolt, "beads.datasrc",
-            g_variant_new_string("dolt"));
-        g_menu_append_item(srcMenu, dolt);
-        g_object_unref(dolt);
-        GMenuItem *jsonl = g_menu_item_new("Prefer issues.jsonl (file on disk)", nullptr);
-        g_menu_item_set_action_and_target_value(jsonl, "beads.datasrc",
-            g_variant_new_string("jsonl"));
-        g_menu_append_item(srcMenu, jsonl);
-        g_object_unref(jsonl);
-        g_menu_append_submenu(sec, "Data Source", G_MENU_MODEL(srcMenu));
-        g_object_unref(srcMenu);
-        g_menu_append(sec, "Export issues.jsonl now (from Dolt)", "beads.exportnow");
+        g_menu_append(sec, "Connect to Remote Repository…", "beads.connectremote");
         g_menu_append_section(projectMenu_, nullptr, G_MENU_MODEL(sec));
         g_object_unref(sec);
     }
@@ -403,7 +526,50 @@ void BeadsPanel::openBeadsFolderDialog() {
 }
 
 // ── WebView ──────────────────────────────────────────────────────────────────
+// ── WebGL rescue for virtio-gpu VMs ─────────────────────────────────────────
+// WebKitGTK 2.52's GL path on virtio-gpu hosts cannot produce the WebGL2
+// context the 3D graph's three.js requires ("Failed to create a graphics
+// context for WebGL using GBM" → the Graph view shows "Graph failed to
+// load." with a stuck spinner). llvmpipe CAN (proven on the headless sway
+// rig: hardware path fails, same compositor + software GL renders). When
+// EVERY render node on the machine is virtio-gpu — so there is no better GPU
+// the override would waste — and the user hasn't chosen a GL stack
+// explicitly, force software GL BEFORE the first WebView exists: the web
+// process inherits the environment at spawn. Caveat (documented): GL
+// contexts created in the HOST process after this point also see it; on a
+// virtio-only VM that trade is correctness over a marginal perf delta.
+// Opt-out: NPPBEADS_NO_GL_OVERRIDE=1.
+static void maybeForceSoftwareGLForWebGL() {
+    if (g_getenv("LIBGL_ALWAYS_SOFTWARE") || g_getenv("NPPBEADS_NO_GL_OVERRIDE"))
+        return;
+    GDir *d = g_dir_open("/sys/class/drm", 0, nullptr);
+    if (!d) return;
+    bool any = false, allVirtio = true;
+    while (const char *name = g_dir_read_name(d)) {
+        if (!g_str_has_prefix(name, "renderD")) continue;
+        any = true;
+        gchar *p = g_strdup_printf("/sys/class/drm/%s/device/uevent", name);
+        gchar *txt = nullptr;
+        if (g_file_get_contents(p, &txt, nullptr, nullptr)) {
+            if (!strstr(txt, "DRIVER=virtio")) allVirtio = false;
+            g_free(txt);
+        } else {
+            allVirtio = false;
+        }
+        g_free(p);
+    }
+    g_dir_close(d);
+    if (any && allVirtio) {
+        g_setenv("LIBGL_ALWAYS_SOFTWARE", "true", FALSE);
+        g_setenv("GALLIUM_DRIVER", "llvmpipe", FALSE);
+        g_message("[NppBeads] virtio-gpu-only host: forcing software GL so "
+                  "the 3D graph's WebGL2 works (NPPBEADS_NO_GL_OVERRIDE=1 "
+                  "to opt out)");
+    }
+}
+
 void BeadsPanel::setupWebView() {
+    maybeForceSoftwareGLForWebGL();
     webContext_ = webkit_web_context_new();
     std::string viewerDir = resourcesDir_ + "/viewer";
     scheme_ = std::make_unique<BeadsSchemeHandler>(viewerDir);
@@ -480,6 +646,7 @@ void BeadsPanel::installUserScripts() {
 }
 
 void BeadsPanel::loadViewer() {
+    loadCount_++;
     if (resourcesDir_.empty()) return;
     std::string idx = resourcesDir_ + "/viewer/index.html";
     if (!g_file_test(idx.c_str(), G_FILE_TEST_EXISTS)) {
@@ -622,13 +789,22 @@ void BeadsPanel::setViewMode(BeadsViewMode m, bool navigate) {
 
 // ── public API ───────────────────────────────────────────────────────────────
 void BeadsPanel::bindProject(std::shared_ptr<BeadsProject> project) {
-    // Same-project rebind → refresh only, no reload.
+    // Same-project rebind → refresh only, no reload. For a remote, restart
+    // the fetcher so a changed/removed token applies immediately (macOS
+    // reconnect semantics).
     if (project && project_ && !project->beadsDir.empty() &&
         project->beadsDir == project_->beadsDir) {
         project_ = project;
-        ds_->bindToPath(project->jsonlPath);
-        watcher_->watchPath(project->jsonlPath);
-        if (!project->projectRoot.empty()) BeadsRecent::push(project->projectRoot);
+        if (project->isRemote()) {
+            BeadsRecent::pushRemote(project->remoteSpec, project->remoteDisplay);
+            stopRemoteFetch();
+            ds_->setFedExternally(true);
+            startRemoteFetch();
+        } else {
+            ds_->bindToPath(project->jsonlPath);
+            watcher_->watchPath(project->jsonlPath);
+            if (!project->projectRoot.empty()) BeadsRecent::push(project->projectRoot);
+        }
         refreshTitleBar();
         refreshStatusBar();
         if (projectChangedHandler_) projectChangedHandler_(project_);
@@ -641,6 +817,7 @@ void BeadsPanel::bindProject(std::shared_ptr<BeadsProject> project) {
     // terminates its child process.
     if (poll_) { poll_->stop(); poll_.reset(); }
     if (tail_) { tail_->stop(); tail_.reset(); }
+    stopRemoteFetch();
     renderFromBd_ = false;      // until the new project's probe says otherwise
     bcInFlight_ = false;
     bcPending_  = false;
@@ -652,17 +829,35 @@ void BeadsPanel::bindProject(std::shared_ptr<BeadsProject> project) {
     activeDataSource_ = ds_.get();
     bdDataSource_.reset();
     bdRunner_.reset();
+    dotMenuSig_.clear();        // bd/remote-scoped sections change
 
-    selectDataSourceForProject();
-
-    // Cross-session MRU feeding the switcher dropdown (shared with the
-    // standalone BeadsViewer — macOS shares the same defaults key).
-    if (project_ && !project_->projectRoot.empty())
-        BeadsRecent::push(project_->projectRoot);
+    if (project_ && project_->isRemote()) {
+        // Remote read-only mode: no bd probe, no file watcher, no local
+        // files. The fetcher feeds JsonlDataSource; writes already throw
+        // ReadOnly. fedExternally AFTER bindToPath (which reset it).
+        BeadsRecent::pushRemote(project_->remoteSpec, project_->remoteDisplay);
+        ds_->setFedExternally(true);
+        startRemoteFetch();
+    } else {
+        selectDataSourceForProject();
+        // Cross-session MRU feeding the switcher dropdown (shared with the
+        // standalone BeadsViewer — macOS shares the same defaults key).
+        if (project_ && !project_->projectRoot.empty())
+            BeadsRecent::push(project_->projectRoot);
+    }
+    // Auto-push checkmark: enabled only for a local project; state from the
+    // per-project opt-in (the runner's sandbox flag is set at probe time).
+    if (autoPushAction_) {
+        bool local = project_ && !project_->isRemote();
+        g_simple_action_set_enabled(autoPushAction_, local);
+        g_simple_action_set_state(autoPushAction_, g_variant_new_boolean(
+            local && BeadsRecent::autoPushFor(project_->projectRoot)));
+    }
 
     refreshTitleBar();
     refreshStatusBar();
     rebuildProjectMenu();
+    rebuildDotMenu();
     installUserScripts();
 
     // Reload only if the page is already settled (mirrors the macOS
@@ -677,6 +872,9 @@ void BeadsPanel::bindProject(std::shared_ptr<BeadsProject> project) {
 void BeadsPanel::selectDataSourceForProject() {
     if (!project_ || project_->projectRoot.empty()) return;
     bdRunner_ = std::make_shared<BdCommandRunner>(project_->projectRoot);
+    // Per-project auto-push opt-in: default is sandbox ON (bd gets
+    // --sandbox, Dolt auto-push disabled). Opted-in projects drop the flag.
+    bdRunner_->setUseSandbox(!BeadsRecent::autoPushFor(project_->projectRoot));
     BdCommandRunner *probed = bdRunner_.get();
     bdRunner_->probe([this, probed](bool bdPresent, bool projectReady) {
         if (bdRunner_.get() != probed) return;   // superseded by a later bind
@@ -697,6 +895,7 @@ void BeadsPanel::selectDataSourceForProject() {
             }
             if (exportAction_) g_simple_action_set_enabled(exportAction_, TRUE);
             projectMenuSig_.clear();   // menu gains the Data Source section
+            dotMenuSig_.clear();
             g_message("[NppBeads] bd backend active — %s (render: %s)",
                       activeDataSource_->backendLabel().c_str(),
                       renderFromBd_ ? "dolt" : "jsonl");
@@ -870,6 +1069,7 @@ void BeadsPanel::exportJsonlNow() {
 }
 
 void BeadsPanel::reloadData() {
+    reloadDataCount_++;
     // Dolt-priority: "reload" means a fresh pull from the database, not a
     // file re-read. broadcastDataChanged owns that path (incl. coalescing).
     if (renderFromBd_ && bdRunner_) { broadcastDataChanged(); return; }
@@ -933,13 +1133,321 @@ void BeadsPanel::openBeadsDir() {
     if (err) { g_message("[NppBeads] openBeadsDir: %s", err->message); g_error_free(err); }
 }
 
+// Select issues.jsonl in the file manager (macOS ctxRevealJsonl). Falls back
+// to opening .beads/ when the file hasn't been materialized yet.
+void BeadsPanel::revealJsonl() {
+    if (!project_ || project_->jsonlPath.empty() ||
+        !g_file_test(project_->jsonlPath.c_str(), G_FILE_TEST_EXISTS)) {
+        openBeadsDir();
+        return;
+    }
+    GFile *f = g_file_new_for_path(project_->jsonlPath.c_str());
+    GtkFileLauncher *l = gtk_file_launcher_new(f);
+    GtkRoot *rootWin = gtk_widget_get_root(root_);
+    gtk_file_launcher_open_containing_folder(l,
+        GTK_IS_WINDOW(rootWin) ? GTK_WINDOW(rootWin) : nullptr, nullptr,
+        +[](GObject *src, GAsyncResult *res, gpointer){
+            GError *err = nullptr;
+            gtk_file_launcher_open_containing_folder_finish(
+                GTK_FILE_LAUNCHER(src), res, &err);
+            if (err) { g_message("[NppBeads] revealJsonl: %s", err->message); g_error_free(err); }
+        }, nullptr);
+    g_object_unref(l);
+    g_object_unref(f);
+}
+
+static void beadsShowInfo(GtkWidget *anchor, const char *title, const std::string &detail) {
+    GtkAlertDialog *a = gtk_alert_dialog_new("%s", title);
+    gtk_alert_dialog_set_detail(a, detail.c_str());
+    GtkRoot *rootWin = gtk_widget_get_root(anchor);
+    gtk_alert_dialog_show(a, GTK_IS_WINDOW(rootWin) ? GTK_WINDOW(rootWin) : nullptr);
+    g_object_unref(a);
+}
+
+// First 1000 chars of the raw JSONL (macOS ctxShowJsonlHead).
+void BeadsPanel::showJsonlHead() {
+    std::string raw = ds_->rawText();
+    std::string head = raw.size() > 1000 ? raw.substr(0, 1000) : raw;
+    char title[64];
+    g_snprintf(title, sizeof title, "JSONL head (%zu bytes total)", raw.size());
+    beadsShowInfo(root_, title, head.empty() ? "(empty — no JSONL loaded)" : head);
+}
+
+// Per-project bd auto-push opt-in (macOS _didToggleAutoPush). Updates
+// persistence, the live runner's sandbox flag, the read cache, and nudges the
+// user about the trade-off the first time it goes on. No modal confirmation —
+// the toggle is reversible.
+void BeadsPanel::toggleAutoPush() {
+    if (!project_ || project_->isRemote() || project_->projectRoot.empty()) {
+        gtk_widget_error_bell(root_);
+        return;
+    }
+    bool nowEnabled = !BeadsRecent::autoPushFor(project_->projectRoot);
+    BeadsRecent::setAutoPush(project_->projectRoot, nowEnabled);
+    if (autoPushAction_)
+        g_simple_action_set_state(autoPushAction_, g_variant_new_boolean(nowEnabled));
+    if (bdRunner_) {
+        bdRunner_->setUseSandbox(!nowEnabled);
+        bdRunner_->invalidateCache();
+    }
+    g_message("[NppBeads] auto-push %s for %s",
+              nowEnabled ? "ENABLED (sandbox OFF)" : "disabled (sandbox ON — default)",
+              project_->projectRoot.c_str());
+    if (nowEnabled) {
+        beadsShowInfo(root_, "bd auto-push enabled for this project",
+            "Every bd write will now attempt a `dolt push` to the configured "
+            "remote. If non-interactive auth isn't set up, writes can hang "
+            "~23s each. Toggle back off via the same menu if writes become "
+            "slow.");
+    }
+}
+
+// Native + JS-probe state → clipboard (macOS ctxCopyDiagnostics). The JS
+// probe runs FIRST; the string is assembled and presented in its completion
+// so bridge state is actually captured.
+void BeadsPanel::copyDiagnostics() {
+    static const char *kProbe =
+        "(function(){var out={};"
+        "out.hasBridge=!!window.__nppBeads;"
+        "out.bridgeVersion=(window.__nppBeads&&window.__nppBeads.version)||null;"
+        "out.bridgeMode=(window.__nppBeads&&window.__nppBeads.mode)||null;"
+        "out.jsonlLen=(window.__nppBeads&&window.__nppBeads.jsonl)?window.__nppBeads.jsonl.length:null;"
+        "out.hasDbPromise=!!(window.__nppBeads&&window.__nppBeads.dbBytesPromise);"
+        "out.hasInitSqlJs=typeof window.initSqlJs==='function';"
+        "out.hasSQLCached=!!(window.initSqlJs&&window.initSqlJs.cached);"
+        "out.hasBeadsViewer=!!window.beadsViewer;"
+        "out.hasDB=!!(window.beadsViewer&&window.beadsViewer.DB_STATE&&window.beadsViewer.DB_STATE.db);"
+        "out.dbSource=(window.beadsViewer&&window.beadsViewer.DB_STATE&&window.beadsViewer.DB_STATE.source)||null;"
+        "out.errorTitle=(window.beadsViewer&&window.beadsViewer.ERROR_STATE&&window.beadsViewer.ERROR_STATE.error)?window.beadsViewer.ERROR_STATE.error.title:null;"
+        "out.errorDetails=(window.beadsViewer&&window.beadsViewer.ERROR_STATE&&window.beadsViewer.ERROR_STATE.error)?window.beadsViewer.ERROR_STATE.error.details:null;"
+        "return JSON.stringify(out);})();";
+    webkit_web_view_evaluate_javascript(webView_, kProbe, -1, nullptr, nullptr,
+        nullptr,
+        +[](GObject *src, GAsyncResult *res, gpointer u) {
+            auto *self = static_cast<BeadsPanel *>(u);
+            std::string bridgeState = "(no response)";
+            GError *err = nullptr;
+            JSCValue *v = webkit_web_view_evaluate_javascript_finish(
+                WEBKIT_WEB_VIEW(src), res, &err);
+            if (v) {
+                if (jsc_value_is_string(v)) {
+                    gchar *str = jsc_value_to_string(v);
+                    bridgeState = str ? str : "(null)";
+                    g_free(str);
+                }
+                g_object_unref(v);
+            } else if (err) {
+                bridgeState = std::string("(probe failed: ") + err->message + ")";
+                g_error_free(err);
+            }
+            self->finishDiagnostics(bridgeState);
+        }, this);
+}
+
+void BeadsPanel::finishDiagnostics(const std::string &bridgeState) {
+    std::string s;
+    s += "NppBeads diagnostics\n====================\n";
+    s += "resourcesDir: " + resourcesDir_ + "\n";
+    std::string indexPath = resourcesDir_ + "/viewer/index.html";
+    s += std::string("viewer index.html exists: ") +
+         (g_file_test(indexPath.c_str(), G_FILE_TEST_EXISTS) ? "YES" : "NO") + "\n";
+    s += "project root: " + (project_ ? project_->projectRoot : "(nil)") + "\n";
+    s += ".beads dir  : " + (project_ ? project_->beadsDir : "(nil)") + "\n";
+    s += "jsonl path  : " + (project_ ? project_->jsonlPath : "(nil)") + "\n";
+    s += "db path     : " + (project_ ? project_->dbPath : "(nil)") + "\n";
+    if (project_ && project_->isRemote()) {
+        s += "remote spec : " + project_->remoteSpec + "\n";
+        s += "remote error: " + (remote_ && !remote_->lastError().empty()
+                                 ? remote_->lastError() : "(none)") + "\n";
+    }
+    char buf[256];
+    g_snprintf(buf, sizeof buf,
+        "issues: %zu open, %zu blocked, %zu closed, %zu total\n",
+        ds_->openIssueCount(), ds_->blockedIssueCount(),
+        ds_->closedIssueCount(), ds_->issueCount());
+    s += buf;
+    s += std::string("viewerLoaded: ") + (viewerLoaded_ ? "YES" : "NO") + "\n";
+    const char *uri = webView_ ? webkit_web_view_get_uri(webView_) : nullptr;
+    s += std::string("webView URL: ") + (uri ? uri : "(none)") + "\n";
+    s += std::string("backend: ") +
+         (activeDataSource_ ? activeDataSource_->backendLabel() : "(none)") +
+         (renderFromBd_ ? " · dolt" : " · jsonl") + "\n";
+    g_snprintf(buf, sizeof buf,
+        "_loadViewer calls: %u\nreloadData calls: %u\nwatcher fires: %u\n",
+        loadCount_, reloadDataCount_, watcherFireCount_);
+    s += buf;
+    if (tail_) {
+        g_snprintf(buf, sizeof buf,
+            "events feed: records=%u lastSeq=%llu paused=%s\n",
+            tail_->recordCount(), (unsigned long long)tail_->lastSeq(),
+            tail_->isPaused() ? "YES" : "NO");
+        s += buf;
+    } else if (poll_) {
+        s += "poll: active\n";
+    } else {
+        s += "live sync: (none)\n";
+    }
+    s += "\n-- bridge state (JS) --\n" + bridgeState + "\n";
+
+    gdk_clipboard_set_text(gtk_widget_get_clipboard(root_), s.c_str());
+    char title[80];
+    g_snprintf(title, sizeof title, "NppBeads diagnostics copied");
+    char detail[128];
+    g_snprintf(detail, sizeof detail,
+        "%zu bytes copied to the clipboard. Paste it into a bug report.",
+        s.size());
+    beadsShowInfo(root_, title, detail);
+}
+
+// ── remote read-only mode (macOS nppmac-0th / nppmac-iik) ───────────────────
+void BeadsPanel::stopRemoteFetch() {
+    if (remote_) { remote_->stop(); remote_.reset(); }
+}
+
+void BeadsPanel::startRemoteFetch() {
+    if (!project_ || !project_->isRemote()) return;
+    std::string token = RemoteJsonlFetcher::tokenForSpec(project_->remoteSpec);
+    auto remote = std::make_unique<RemoteJsonlFetcher>(project_->remoteSpec, token);
+    RemoteJsonlFetcher *captured = remote.get();   // identity-gates stale callbacks
+    remote->onText = [this, captured](const std::string &jsonl) {
+        if (remote_.get() != captured) return;     // superseded by later bind
+        ds_->setFedExternally(true);
+        ds_->adoptRawText(jsonl);
+        g_message("[NppBeads] remote fetch: adopted %zu bytes", jsonl.size());
+        installUserScripts();
+        refreshStatusBar();
+        if (viewerLoaded_) pushJsonlToWebview(jsonl);
+    };
+    remote->onError = [this, captured](const std::string &message) {
+        if (remote_.get() != captured) return;
+        g_message("[NppBeads] remote fetch error: %s", message.c_str());
+        refreshStatusBar();                        // surfaces lastError
+    };
+    remote_ = std::move(remote);
+    remote_->start();
+    g_message("[NppBeads] remote read-only mode: %s (token: %s)",
+              project_->remoteSpec.c_str(), token.empty() ? "none" : "from keyring");
+}
+
+void BeadsPanel::pickRemote(const std::string &spec, const std::string &display) {
+    auto p = BeadsProjectScanner::remoteProject(spec, display);
+    if (p) bindProject(p);
+}
+
+// "Connect to Remote Repository…" (macOS sheet → GTK modal window). URL entry
+// is a 3-line wrapping view so long self-hosted URLs stay reviewable;
+// whitespace/newlines are stripped from pasted input before parsing.
+void BeadsPanel::connectRemoteDialog() {
+    GtkWidget *win = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(win), "Connect to Remote Repository");
+    gtk_window_set_modal(GTK_WINDOW(win), TRUE);
+    gtk_window_set_default_size(GTK_WINDOW(win), 480, -1);
+    GtkRoot *rootWin = gtk_widget_get_root(root_);
+    if (GTK_IS_WINDOW(rootWin))
+        gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(rootWin));
+
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_start(box, 12);
+    gtk_widget_set_margin_end(box, 12);
+    gtk_widget_set_margin_top(box, 12);
+    gtk_widget_set_margin_bottom(box, 12);
+
+    GtkWidget *blurb = gtk_label_new(
+        "Monitors a repository's .beads/issues.jsonl over HTTP(S) — "
+        "read-only, refreshed every minute. GitHub repos, self-hosted "
+        "Gitea/Forgejo repo URLs, and direct raw-file URLs all work.\n\n"
+        "Private repositories need an access token (GitHub: fine-grained "
+        "PAT with \u201cContents: Read-only\u201d; Gitea: any API token). "
+        "The token is kept in your keyring.");
+    gtk_label_set_wrap(GTK_LABEL(blurb), TRUE);
+    gtk_label_set_xalign(GTK_LABEL(blurb), 0.0f);
+    gtk_box_append(GTK_BOX(box), blurb);
+
+    GtkWidget *urlFrame = gtk_frame_new(nullptr);
+    GtkWidget *urlView = gtk_text_view_new();
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(urlView), GTK_WRAP_CHAR);
+    gtk_text_view_set_top_margin(GTK_TEXT_VIEW(urlView), 4);
+    gtk_text_view_set_left_margin(GTK_TEXT_VIEW(urlView), 4);
+    gtk_text_view_set_right_margin(GTK_TEXT_VIEW(urlView), 4);
+    gtk_widget_set_size_request(urlView, -1, 56);
+    gtk_frame_set_child(GTK_FRAME(urlFrame), urlView);
+    gtk_widget_set_tooltip_text(urlView,
+        "github.com/owner/repo · http(s)://host/owner/repo · raw issues.jsonl URL");
+    gtk_box_append(GTK_BOX(box), urlFrame);
+
+    GtkWidget *branchEntry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(branchEntry), "branch (default: main)");
+    gtk_box_append(GTK_BOX(box), branchEntry);
+
+    GtkWidget *tokenEntry = gtk_password_entry_new();
+    g_object_set(tokenEntry, "placeholder-text",
+                 "access token (optional — private repos)", nullptr);
+    gtk_box_append(GTK_BOX(box), tokenEntry);
+
+    GtkWidget *btnRow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_halign(btnRow, GTK_ALIGN_END);
+    GtkWidget *cancel = gtk_button_new_with_label("Cancel");
+    GtkWidget *connect = gtk_button_new_with_label("Connect");
+    gtk_widget_add_css_class(connect, "suggested-action");
+    gtk_box_append(GTK_BOX(btnRow), cancel);
+    gtk_box_append(GTK_BOX(btnRow), connect);
+    gtk_box_append(GTK_BOX(box), btnRow);
+    gtk_window_set_child(GTK_WINDOW(win), box);
+
+    struct Ctx { BeadsPanel *self; GtkWidget *win, *urlView, *branchEntry, *tokenEntry; };
+    auto *ctx = new Ctx{this, win, urlView, branchEntry, tokenEntry};
+    g_object_set_data_full(G_OBJECT(win), "npp-ctx", ctx,
+                           +[](gpointer p){ delete static_cast<Ctx *>(p); });
+
+    g_signal_connect(cancel, "clicked", G_CALLBACK(+[](GtkButton *, gpointer u){
+        gtk_window_destroy(GTK_WINDOW(static_cast<Ctx *>(u)->win));
+    }), ctx);
+    g_signal_connect(connect, "clicked", G_CALLBACK(+[](GtkButton *, gpointer u){
+        auto *c = static_cast<Ctx *>(u);
+        GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(c->urlView));
+        GtkTextIter a;   // NOTE: no `a, b` — a top-level comma inside a
+        GtkTextIter b;   // G_CALLBACK(...) lambda splits the macro argument.
+        gtk_text_buffer_get_bounds(buf, &a, &b);
+        gchar *rawText = gtk_text_buffer_get_text(buf, &a, &b, FALSE);
+        // URLs contain no whitespace; a wrapped field invites stray
+        // newlines in pasted input — strip it ALL before parsing.
+        std::string rawInput;
+        for (const char *p2 = rawText; p2 && *p2; p2++)
+            if (!g_ascii_isspace(*p2)) rawInput += *p2;
+        g_free(rawText);
+        std::string branch = gtk_editable_get_text(GTK_EDITABLE(c->branchEntry));
+        std::string token = gtk_editable_get_text(GTK_EDITABLE(c->tokenEntry));
+        std::string display;
+        std::string spec = RemoteJsonlFetcher::specForInput(rawInput, branch, &display);
+        if (spec.empty()) {
+            beadsShowInfo(c->win, "Can't understand that repository",
+                "Enter a GitHub repo as owner/repo (or its github.com URL), "
+                "a self-hosted Gitea/Forgejo repo URL like "
+                "http(s)://host/owner/repo, or a full URL pointing straight "
+                "at a raw issues.jsonl file.");
+            return;
+        }
+        // Store (or clear) the token BEFORE binding — startRemoteFetch reads
+        // it back from the keyring. An empty field on reconnect deliberately
+        // forgets a previously saved token.
+        RemoteJsonlFetcher::storeToken(token, spec);
+        BeadsPanel *self = c->self;
+        gtk_window_destroy(GTK_WINDOW(c->win));
+        self->pickRemote(spec, display);
+    }), ctx);
+
+    gtk_window_present(GTK_WINDOW(win));
+}
+
 void BeadsPanel::setWindowActive(bool active) {
     if (active) {
         if (poll_) poll_->resume();
         if (tail_) tail_->resume();   // flushes any change that arrived while blurred
+        if (remote_) remote_->resume();
     } else {
         if (poll_) poll_->pause();
         if (tail_) tail_->pause();
+        if (remote_) remote_->pause();
     }
 }
 
@@ -950,8 +1458,10 @@ std::vector<std::shared_ptr<BeadsProject>> BeadsPanel::discoverProjects(size_t m
 
 // ── status / title ───────────────────────────────────────────────────────────
 void BeadsPanel::refreshTitleBar() {
-    std::string label = project_ ? (pathLeaf(project_->projectRoot) + " ▾") : "(no project) ▾";
-    gtk_menu_button_set_label(GTK_MENU_BUTTON(projectChip_), label.c_str());
+    std::string name = !project_ ? "(no project)"
+        : project_->isRemote() ? project_->remoteDisplay
+        : pathLeaf(project_->projectRoot);
+    gtk_menu_button_set_label(GTK_MENU_BUTTON(projectChip_), (name + " ▾").c_str());
     if (project_) gtk_widget_set_tooltip_text(projectChip_, project_->projectRoot.c_str());
 
     // Board + Activity filter their lists; on Graph it is Find-node.
@@ -972,6 +1482,19 @@ void BeadsPanel::refreshStatusBar() {
     std::string text;
     if (!project_) {
         text = "no project · click the project name ▾ to pick one";
+    } else if (project_->isRemote()) {
+        const std::string &err = remote_ ? remote_->lastError() : std::string();
+        if (!err.empty()) {
+            text = project_->remoteDisplay + " · remote · ⚠ " + err;
+        } else {
+            size_t total = ds_->issueCount(), open = ds_->openIssueCount(),
+                   blk = ds_->blockedIssueCount(), cls = ds_->closedIssueCount();
+            char buf[512];
+            g_snprintf(buf, sizeof buf,
+                "%s · %zu issues (%zu open · %zu blocked · %zu closed) · remote · read-only",
+                project_->remoteDisplay.c_str(), total, open, blk, cls);
+            text = buf;
+        }
     } else if (project_->jsonlPath.empty()) {
         text = pathLeaf(project_->projectRoot) + " · no issues.jsonl yet";
     } else {

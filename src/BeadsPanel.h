@@ -15,6 +15,7 @@
 #include "BeadsPoll.h"
 #include "BdEventsTail.h"
 #include "BeadsSchemeHandler.h"
+#include "RemoteJsonlFetcher.h"
 
 #include <gtk/gtk.h>
 #include <webkit/webkit.h>
@@ -66,6 +67,12 @@ private:
     void setupWebView();
     GtkWidget *makeToolbar();
     void rebuildProjectMenu();
+    void rebuildDotMenu();            // "More actions" overflow (macOS ⋯ menu)
+    void revealJsonl();               // select issues.jsonl in the file manager
+    void copyDiagnostics();           // native + JS-probe state → clipboard
+    void showJsonlHead();             // first 1000 chars of the raw JSONL
+    void toggleAutoPush();            // per-project bd auto-push opt-in
+    void finishDiagnostics(const std::string &bridgeState);
     void pickProjectRoot(const std::string &root);
     void openBeadsFolderDialog();
     void refreshStatusBar();
@@ -84,6 +91,12 @@ private:
     void pushTheme();
     void pushSearchQuery(const std::string &q);
     bool isDark() const;
+
+    // remote read-only mode (macOS nppmac-0th / nppmac-iik)
+    void startRemoteFetch();
+    void stopRemoteFetch();
+    void connectRemoteDialog();
+    void pickRemote(const std::string &spec, const std::string &display);
 
     // data source
     void selectDataSourceForProject();
@@ -131,6 +144,10 @@ private:
     GtkWidget *searchEntry_ = nullptr;
     GtkWidget *statusLabel_ = nullptr;
     GtkWidget *themeBtn_ = nullptr;
+    GtkWidget *folderBtn_ = nullptr;      // Reveal .beads/ (macOS folder button)
+    GtkWidget *dotBtn_ = nullptr;         // "More actions" GtkMenuButton
+    GMenu *dotMenu_ = nullptr;            // persistent model, rebuilt on map
+    std::string dotMenuSig_;
     WebKitWebView *webView_ = nullptr;
     WebKitWebContext *webContext_ = nullptr;
     WebKitUserContentManager *ucm_ = nullptr;
@@ -146,6 +163,13 @@ private:
                                            // mutually exclusive with poll_
     GSimpleAction *datasrcAction_ = nullptr;   // owned by the action group
     GSimpleAction *exportAction_ = nullptr;
+    GSimpleAction *autoPushAction_ = nullptr;  // stateful bool (menu checkmark)
+    std::unique_ptr<RemoteJsonlFetcher> remote_;  // read-only remote mode
+
+    // Diagnostics counters (macOS ctxCopyDiagnostics parity).
+    unsigned loadCount_ = 0;
+    unsigned reloadDataCount_ = 0;
+    unsigned watcherFireCount_ = 0;
 
     // Data-source priority: when true the webview renders from the Dolt DB
     // (`bd export` to stdout) instead of the issues.jsonl file. Default on in

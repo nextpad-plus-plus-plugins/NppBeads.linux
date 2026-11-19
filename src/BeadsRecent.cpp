@@ -3,6 +3,8 @@
 #include "BeadsRecent.h"
 #include <glib.h>
 #include <algorithm>
+#include <cstring>
+#include <cstdlib>
 
 namespace BeadsRecent {
 
@@ -117,6 +119,73 @@ bool jsonlPriorityFor(const std::string &root) {
 }
 void setJsonlPriority(const std::string &root, bool enabled) {
     setProjectKey(root, "jsonl-priority", enabled ? "true" : "false");
+}
+
+bool autoPushFor(const std::string &root) {
+    return getProjectKey(root, "auto-push") == "true";
+}
+void setAutoPush(const std::string &root, bool enabled) {
+    setProjectKey(root, "auto-push", enabled ? "true" : "false");
+}
+
+int eventsPidFor(const std::string &root, int *recorderOut) {
+    if (recorderOut) *recorderOut = 0;
+    std::string v = getProjectKey(root, "events-pid");
+    if (v.empty()) return 0;
+    size_t colon = v.find(':');
+    if (colon != std::string::npos && recorderOut)
+        *recorderOut = atoi(v.c_str() + colon + 1);
+    return atoi(v.c_str());
+}
+void setEventsPid(const std::string &root, int pid, int recorderPid) {
+    setProjectKey(root, "events-pid",
+                  std::to_string(pid) + ":" + std::to_string(recorderPid));
+}
+
+// ── Recent remote connections ("remotes" group; "spec\x1fdisplay" rows) ─────
+std::vector<RemoteEntry> loadRemotes() {
+    std::vector<RemoteEntry> out;
+    GKeyFile *kf = g_key_file_new();
+    if (g_key_file_load_from_file(kf, iniPath().c_str(), G_KEY_FILE_NONE, nullptr)) {
+        gsize n = 0;
+        gchar **arr = g_key_file_get_string_list(kf, "remotes", "entries", &n, nullptr);
+        for (gsize i = 0; arr && i < n; i++) {
+            const char *sep = arr[i] ? strchr(arr[i], '\x1f') : nullptr;
+            if (!sep) continue;
+            RemoteEntry e;
+            e.spec.assign(arr[i], sep - arr[i]);
+            e.display = sep + 1;
+            if (!e.spec.empty()) out.push_back(std::move(e));
+        }
+        if (arr) g_strfreev(arr);
+    }
+    g_key_file_free(kf);
+    return out;
+}
+
+void pushRemote(const std::string &spec, const std::string &display) {
+    if (spec.empty()) return;
+    auto list = loadRemotes();
+    list.erase(std::remove_if(list.begin(), list.end(),
+        [&](const RemoteEntry &e){ return e.spec == spec; }), list.end());
+    list.insert(list.begin(), {spec, display.empty() ? spec : display});
+    if (list.size() > 6) list.resize(6);
+
+    GKeyFile *kf = g_key_file_new();
+    g_key_file_load_from_file(kf, iniPath().c_str(),
+        (GKeyFileFlags)(G_KEY_FILE_KEEP_COMMENTS), nullptr);  // keep other groups
+    std::vector<std::string> rows;
+    std::vector<const char *> ptrs;
+    for (auto &e : list) {
+        rows.push_back(e.spec + '\x1f' + e.display);
+        ptrs.push_back(rows.back().c_str());
+    }
+    g_key_file_set_string_list(kf, "remotes", "entries", ptrs.data(), ptrs.size());
+    gchar *dir = g_path_get_dirname(iniPath().c_str());
+    g_mkdir_with_parents(dir, 0755);
+    g_free(dir);
+    g_key_file_save_to_file(kf, iniPath().c_str(), nullptr);
+    g_key_file_free(kf);
 }
 
 }  // namespace BeadsRecent

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(NppBeads VERSION 1.0.1 LANGUAGES CXX)
+project(NppBeads VERSION 1.0.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,6 +10,7 @@ endif()
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GLIB REQUIRED IMPORTED_TARGET glib-2.0 gio-2.0 json-glib-1.0)
+pkg_check_modules(REMOTE REQUIRED IMPORTED_TARGET libsoup-3.0 libsecret-1)
 pkg_check_modules(WEBKIT REQUIRED IMPORTED_TARGET gtk4 libadwaita-1 webkitgtk-6.0)
 
 set(NPP_LINUX_DIR "${CMAKE_SOURCE_DIR}/../../nextpad-plus-plus-gtk4")
@@ -24,10 +25,11 @@ add_library(beads_core STATIC
     src/BeadsWatcher.cpp
     src/BeadsPoll.cpp
     src/BdEventsTail.cpp
+    src/RemoteJsonlFetcher.cpp
     src/BeadsRecent.cpp)
 target_include_directories(beads_core PUBLIC src "${NPP_LINUX_DIR}/src"
     "${NPP_LINUX_DIR}/scintilla/include")
-target_link_libraries(beads_core PUBLIC PkgConfig::GLIB)
+target_link_libraries(beads_core PUBLIC PkgConfig::GLIB PkgConfig::REMOTE)
 set_property(TARGET beads_core PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 # View layer (needs WebKitGTK/GTK4): scheme handler + editor indicator.

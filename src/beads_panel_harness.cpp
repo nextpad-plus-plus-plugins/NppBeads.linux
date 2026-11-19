@@ -8,6 +8,7 @@
 
 #include "BeadsPanel.h"
 #include "BeadsProjectScanner.h"
+#include "RemoteJsonlFetcher.h"
 #include <adwaita.h>
 #include <string>
 
@@ -39,6 +40,18 @@ static std::string dumpChipMenu(BeadsPanel *panel) {
     return out;
 }
 
+// The "More actions" overflow is the toolbar's LAST child (chip, dropdown,
+// search, refresh, theme, folder, dot).
+static std::string dumpDotMenu(BeadsPanel *panel) {
+    GtkWidget *toolbar = gtk_widget_get_first_child(panel->widget());
+    GtkWidget *w = gtk_widget_get_first_child(toolbar);
+    GtkWidget *last = w;
+    while (w) { last = w; w = gtk_widget_get_next_sibling(w); }
+    std::string out;
+    dumpModel(gtk_menu_button_get_menu_model(GTK_MENU_BUTTON(last)), out);
+    return out;
+}
+
 static gboolean quitCb(gpointer) {
     g_print("HARNESS: timeout reached, exiting 0\n");
     exit(0);
@@ -59,21 +72,35 @@ int main(int argc, char **argv) {
         };
         BeadsPanel *p = new BeadsPanel(argv[1]);
         std::string d0 = dumpChipMenu(p);
-        g_print("--- empty-state menu ---\n%s", d0.c_str());
+        g_print("--- empty-state chip menu ---\n%s", d0.c_str());
         expect("empty.open",    d0, "Open .beads folder", true);
+        expect("empty.connect", d0, "Connect to Remote Repository", true);
         expect("empty.nopick",  d0, "beads.pickroot", false);
         expect("empty.nounbind",d0, "Unbind", false);
         expect("empty.noreveal",d0, "Reveal", false);
+        std::string e0 = dumpDotMenu(p);
+        g_print("--- empty-state dot menu ---\n%s", e0.c_str());
+        expect("dot0.switch",   e0, "Switch project", true);
+        expect("dot0.reloadv",  e0, "Reload viewer", true);
+        expect("dot0.diag",     e0, "Copy diagnostics", true);
+        expect("dot0.head",     e0, "Show raw JSONL head", true);
+        expect("dot0.noreveal", e0, "Reveal issues.jsonl", false);
+        expect("dot0.nopush",   e0, "auto-push", false);
 
         auto proj = BeadsProjectScanner::projectFromRoot(argv[2]);
         if (!proj) { g_printerr("MENUFAIL no test project\n"); return 3; }
         p->bindProject(proj);
         std::string d1 = dumpChipMenu(p);
-        g_print("--- bound-state menu ---\n%s", d1.c_str());
+        g_print("--- bound-state chip menu ---\n%s", d1.c_str());
         expect("bound.current", d1, "✓ ", true);
         expect("bound.open",    d1, "Open .beads folder", true);
         expect("bound.unbind",  d1, "Unbind current project", true);
-        expect("bound.reveal",  d1, "Reveal .beads/ folder", true);
+        expect("bound.noreveal",d1, "Reveal", false);   // moved to the dot menu
+        std::string e1 = dumpDotMenu(p);
+        g_print("--- bound-state dot menu ---\n%s", e1.c_str());
+        expect("dot1.reveal",   e1, "Reveal issues.jsonl", true);
+        expect("dot1.openb",    e1, "Open .beads/ folder", true);
+        expect("dot1.push",     e1, "Enable bd auto-push", true);
 
         // Recents persisted by the bind?
         std::string ini = std::string(g_get_user_config_dir()) + "/beadsviewer/recent.ini";
@@ -114,10 +141,22 @@ int main(int argc, char **argv) {
     gtk_window_set_child(GTK_WINDOW(win), panel->widget());
     gtk_window_present(GTK_WINDOW(win));
 
-    auto proj = BeadsProjectScanner::projectFromRoot(argv[2]);
-    if (!proj) { g_printerr("HARNESS: no .beads/ under %s\n", argv[2]); return 3; }
-    g_print("HARNESS: binding project %s (jsonl=%s)\n",
-            proj->projectRoot.c_str(), proj->jsonlPath.c_str());
+    // Remote mode: NPPBEADS_TEST_REMOTE=<repo input> binds a read-only
+    // remote connection instead of the local path (token via the
+    // NPPBEADS_REMOTE_TOKEN seam).
+    std::shared_ptr<BeadsProject> proj;
+    if (const char *rin = g_getenv("NPPBEADS_TEST_REMOTE")) {
+        std::string display;
+        std::string spec = RemoteJsonlFetcher::specForInput(rin, "", &display);
+        if (spec.empty()) { g_printerr("HARNESS: bad remote input\n"); return 3; }
+        g_print("HARNESS: binding REMOTE %s (%s)\n", spec.c_str(), display.c_str());
+        proj = BeadsProjectScanner::remoteProject(spec, display);
+    } else {
+        proj = BeadsProjectScanner::projectFromRoot(argv[2]);
+        if (!proj) { g_printerr("HARNESS: no .beads/ under %s\n", argv[2]); return 3; }
+        g_print("HARNESS: binding project %s (jsonl=%s)\n",
+                proj->projectRoot.c_str(), proj->jsonlPath.c_str());
+    }
     panel->bindProject(proj);
 
     // Bridge round-trip probe: after the viewer settles, drive a write through
@@ -127,6 +166,44 @@ int main(int argc, char **argv) {
     // Late data probe: after NPPBEADS_TEST_COUNT_AT seconds, log how many
     // issue lines the webview's preloaded JSONL currently holds — proves a
     // live-sync rebroadcast actually reached the page.
+    // Graph probe: at NPPBEADS_TEST_GRAPH_AT seconds switch the SPA to the
+    // Graph route, then 6 s later dump WebGL availability + canvas/scene
+    // state as one GRAPHPROBE line (3D-graph investigation).
+    if (const char *gat = g_getenv("NPPBEADS_TEST_GRAPH_AT")) {
+        int t = atoi(gat);
+        g_timeout_add_seconds(t, [](gpointer p) -> gboolean {
+            static_cast<BeadsPanel *>(p)->injectJS(
+                "console.log('GRAPHPROBE switching to #/graph');"
+                "location.hash='#/graph';");
+            return G_SOURCE_REMOVE;
+        }, panel);
+        g_timeout_add_seconds(t + 6, [](gpointer p) -> gboolean {
+            static_cast<BeadsPanel *>(p)->injectJS(
+                "(function(){var out={};"
+                "try{var c=document.createElement('canvas');"
+                "out.webgl2=!!c.getContext('webgl2');"
+                "out.webgl=!!(c.getContext('webgl')||c.getContext('experimental-webgl'));}"
+                "catch(e){out.glerr=''+e;}"
+                "out.canvases=[].map.call(document.querySelectorAll('canvas'),"
+                "function(c){return c.width+'x'+c.height;});"
+                "out.graphMod=!!window.__nppGraph;"
+                "out.fg3d=typeof window.ForceGraph3D;"
+                "out.fg2d=typeof window.ForceGraph;"
+                "out.three=typeof window.THREE;"
+                "out.sprite=typeof window.SpriteText;"
+                "out.d3f3=typeof window.d3Force3d;"
+                "try{out.dim=localStorage.getItem('nppbeads.graphDimension');}catch(e){}"
+                "out.glCanvas=[].some.call(document.querySelectorAll('canvas'),"
+                "function(c){try{return !!c.getContext('webgl2')||!!c.getContext('webgl');}"
+                "catch(e){return false;}});"
+                "out.hash=location.hash;"
+                "out.err=(window.beadsViewer&&window.beadsViewer.ERROR_STATE&&"
+                "window.beadsViewer.ERROR_STATE.error)||null;"
+                "console.log('GRAPHPROBE '+JSON.stringify(out));})();");
+            return G_SOURCE_REMOVE;
+        }, panel);
+    }
+
     if (const char *at = g_getenv("NPPBEADS_TEST_COUNT_AT")) {
         g_timeout_add_seconds(atoi(at), [](gpointer p) -> gboolean {
             static_cast<BeadsPanel *>(p)->injectJS(
