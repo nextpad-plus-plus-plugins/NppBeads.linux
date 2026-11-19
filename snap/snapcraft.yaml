@@ -33,6 +33,18 @@ slots:
     bus: session
     name: org.nextpadplusplus.BeadsViewer
 
+# WebKitGTK spawns its helper processes by ABSOLUTE path
+# (/usr/lib/<triplet>/webkitgtk-6.0/WebKitNetworkProcess). WEBKIT_EXEC_PATH
+# is compiled out of release builds (developer-mode only — verified: setting
+# it changed nothing), so bind-mount the real path onto the staged copy.
+# Layout keys are literal, hence one entry per architecture; override-build
+# creates BOTH source dirs so the inactive one binds an empty directory.
+layout:
+  /usr/lib/x86_64-linux-gnu/webkitgtk-6.0:
+    bind: $SNAP/usr/lib/x86_64-linux-gnu/webkitgtk-6.0
+  /usr/lib/aarch64-linux-gnu/webkitgtk-6.0:
+    bind: $SNAP/usr/lib/aarch64-linux-gnu/webkitgtk-6.0
+
 parts:
   beadsviewer:
     plugin: nil
@@ -65,6 +77,10 @@ parts:
       # into the snap (same fix as the app's recipe).
       sed -i 's|^Icon=.*|Icon=${SNAP}/usr/share/icons/hicolor/512x512/apps/org.nextpadplusplus.BeadsViewer.png|' \
           "$CRAFT_PART_INSTALL/usr/share/applications/org.nextpadplusplus.BeadsViewer.desktop"
+      # Both layout source dirs must exist on every architecture (see the
+      # layout comment above).
+      mkdir -p "$CRAFT_PART_INSTALL/usr/lib/x86_64-linux-gnu/webkitgtk-6.0" \
+               "$CRAFT_PART_INSTALL/usr/lib/aarch64-linux-gnu/webkitgtk-6.0"
 
 apps:
   beadsviewer:
