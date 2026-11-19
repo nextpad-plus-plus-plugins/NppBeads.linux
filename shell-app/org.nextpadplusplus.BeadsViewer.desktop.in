@@ -2,16 +2,16 @@
 Type=Application
 Name=BeadsViewer
 Comment=Viewer for the Beads (bd) issue tracker — local projects and remote repositories
-Exec=@CMAKE_INSTALL_PREFIX@/bin/beadsviewer %U
+Exec=@CMAKE_INSTALL_PREFIX@/bin/BeadsViewer %U
 Icon=org.nextpadplusplus.BeadsViewer
 Terminal=false
 Categories=Development;ProjectManagement;
 MimeType=inode/directory;
 StartupNotify=true
 DBusActivatable=true
-StartupWMClass=beadsviewer
+StartupWMClass=BeadsViewer
 Actions=new-window;
 
 [Desktop Action new-window]
 Name=New Window
-Exec=@CMAKE_INSTALL_PREFIX@/bin/beadsviewer --new-window
+Exec=@CMAKE_INSTALL_PREFIX@/bin/BeadsViewer --new-window

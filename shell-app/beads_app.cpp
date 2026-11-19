@@ -73,12 +73,17 @@ static std::string resolveResourcesDir() {
         // tree. (Built BEFORE g_free(dir) — the first version of this
         // fallback read `dir` after freeing it and probed a garbage path.)
         std::string dev = std::string(dir) + "/../resources";
+        // Prefix-relative share path: covers /usr, /usr/local, ~/.local AND
+        // the snap mount (/snap/<name>/current/usr/bin/../share/…) in one
+        // candidate.
+        std::string rel = std::string(dir) + "/../share/beadsviewer/resources";
         g_free(dir);
         if (g_file_test((res + "/viewer/index.html").c_str(), G_FILE_TEST_EXISTS)) return res;
         if (g_file_test((dev + "/viewer/index.html").c_str(), G_FILE_TEST_EXISTS)) return dev;
         // Installed layouts: <prefix>/share/beadsviewer/resources for the
         // prefixes we ship to (XDG user dir, /usr/local, /usr).
         const std::string shares[] = {
+            rel,
             std::string(g_get_user_data_dir()) + "/beadsviewer/resources",
             "/usr/local/share/beadsviewer/resources",
             "/usr/share/beadsviewer/resources",

@@ -89,7 +89,7 @@ target_link_libraries(beads_panel_harness PRIVATE beads_view)
 #  Target — BeadsViewer (standalone app; reuses beads_core + beads_view)
 # ─────────────────────────────────────────────────────────────────────────
 add_executable(BeadsViewer shell-app/beads_app.cpp)
-set_target_properties(BeadsViewer PROPERTIES OUTPUT_NAME "beadsviewer")
+set_target_properties(BeadsViewer PROPERTIES OUTPUT_NAME "BeadsViewer")
 target_include_directories(BeadsViewer PRIVATE src shell-app)
 target_compile_definitions(BeadsViewer PRIVATE
     BEADSVIEWER_VERSION="${PROJECT_VERSION}")

@@ -1,0 +1,45 @@
+# Maintainer: Andrew Letov <aletik@gmail.com>
+#
+# BeadsViewer — Arch Linux package for the standalone app. Built by
+# tools/make-arch.sh inside an archlinux:base-devel container (makepkg and
+# pacman cannot run natively on the Ubuntu build hosts); nothing here is
+# container-specific, so pointing source= at a public release tarball turns
+# this into an AUR-ready PKGBUILD unchanged.
+
+pkgname=beadsviewer
+pkgver=1.0.2
+pkgrel=1
+pkgdesc="Viewer for the Beads (bd) issue tracker"
+# Arch proper is x86_64 only; aarch64 is Arch Linux ARM.
+arch=('x86_64' 'aarch64')
+url="https://github.com/nextpad-plus-plus-plugins/NppBeads.linux"
+license=('GPL-3.0-or-later')
+
+# Runtime linkage (ldd-verified): GTK4 + libadwaita shell, WebKitGTK 6.0
+# viewer, json-glib (bd JSON), libsoup3 (remote read-only mode), libsecret
+# (remote tokens in the Secret Service keyring). The beads `bd` CLI is
+# spawned as a binary — invisible to dependency scanners, optional (the
+# viewer is read-only without it), and not packaged by Arch, so it is an
+# optdepends note only. hicolor-icon-theme owns the icon tree we install
+# into (standard Arch practice).
+depends=('gtk4' 'libadwaita' 'webkitgtk-6.0' 'json-glib' 'libsoup3'
+         'libsecret' 'gcc-libs' 'glibc' 'hicolor-icon-theme')
+makedepends=('cmake' 'pkgconf')
+optdepends=('beads: the bd CLI, enables editing (install from https://github.com/gastownhall/beads)')
+
+# !debug: one artifact per architecture, matching the .deb and .rpm.
+options=('!debug')
+
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+    cmake -B build -S "$pkgname-$pkgver" \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX=/usr
+    cmake --build build --target BeadsViewer
+}
+
+package() {
+    DESTDIR="$pkgdir" cmake --install build --component app
+}
