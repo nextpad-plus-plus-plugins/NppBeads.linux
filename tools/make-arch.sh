@@ -40,8 +40,14 @@ if [ -n "${NPP_ARCH_REFRESH:-}" ] || ! "$OCI" image exists "$BUILDER_IMAGE" 2>/d
       "# pacman >= 7 sandboxes downloads (Landlock); rootless podman cannot" \
       "# grant it inside the container — disable, as the app script does." \
       "RUN sed -i '/^\\[options\\]/a DisableSandbox' /etc/pacman.conf" \
-      "RUN pacman -Syu --noconfirm && \\" \
-      "    pacman -S --needed --noconfirm base-devel cmake pkgconf \\" \
+      "# Three RUN layers on purpose: one giant layer (-Syu + the webkit" \
+      "# stack + cache clean) peaked over this VM's free disk during the" \
+      "# layer-commit tar (observed: 'no space left on device' writing" \
+      "# WebKit-6.0.gir). Smaller layers commit one at a time." \
+      "RUN pacman -Syu --noconfirm && pacman -Scc --noconfirm" \
+      "RUN pacman -S --needed --noconfirm base-devel cmake pkgconf && \\" \
+      "    pacman -Scc --noconfirm" \
+      "RUN pacman -S --needed --noconfirm \\" \
       "        gtk4 libadwaita webkitgtk-6.0 json-glib libsoup3 libsecret && \\" \
       "    pacman -Scc --noconfirm" \
       "RUN useradd -m builder" \
