@@ -89,6 +89,8 @@ target_link_libraries(beads_panel_harness PRIVATE beads_view)
 add_executable(BeadsViewer shell-app/beads_app.cpp)
 set_target_properties(BeadsViewer PROPERTIES OUTPUT_NAME "beadsviewer")
 target_include_directories(BeadsViewer PRIVATE src shell-app)
+target_compile_definitions(BeadsViewer PRIVATE
+    BEADSVIEWER_VERSION="${PROJECT_VERSION}")
 target_link_libraries(BeadsViewer PRIVATE beads_view)
 
 # System install (binary → bin/, viewer → share/beadsviewer/resources — the
@@ -97,4 +99,6 @@ install(TARGETS BeadsViewer RUNTIME DESTINATION bin)
 install(FILES resources/toolbar.png DESTINATION share/beadsviewer/resources)
 install(DIRECTORY resources/viewer DESTINATION share/beadsviewer/resources
     PATTERN ".git" EXCLUDE PATTERN ".DS_Store" EXCLUDE PATTERN ".gitignore" EXCLUDE)
-install(FILES shell-app/beadsviewer.desktop DESTINATION share/applications)
+install(FILES shell-app/org.nextpadplusplus.BeadsViewer.desktop
+    DESTINATION share/applications)
+install(DIRECTORY shell-app/icons/hicolor DESTINATION share/icons)

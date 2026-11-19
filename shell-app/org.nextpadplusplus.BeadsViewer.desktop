@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
 Name=BeadsViewer
-Comment=Viewer for the Beads (bd) issue tracker
+Comment=Viewer for the Beads (bd) issue tracker — local projects and remote repositories
 Exec=beadsviewer %U
-Icon=beadsviewer
+Icon=org.nextpadplusplus.BeadsViewer
 Terminal=false
 Categories=Development;ProjectManagement;
 MimeType=inode/directory;

@@ -9,6 +9,7 @@
 #include "BeadsPanel.h"
 #include "BeadsProjectScanner.h"
 #include <adwaita.h>
+#include <glib-unix.h>
 #include <string>
 #include <vector>
 #include <memory>
@@ -16,6 +17,43 @@
 #include <unistd.h>
 
 #include "BeadsRecent.h"   // shared MRU (also used by the plugin panel)
+#include "RemoteJsonlFetcher.h"
+
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <sched.h>
+#include <cstdio>
+
+// ── WebKit sandbox probe (Ubuntu 24.04 AppArmor userns restriction) ─────────
+// Same probe as the plugin entry (NppBeads.cpp): without it, WebKit's bwrap
+// launcher aborts the whole process on hosts that restrict unprivileged user
+// namespaces. Must run before ANY WebKit initialization.
+static bool userNamespacesUsable() {
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        if (unshare(CLONE_NEWUSER) != 0) _exit(1);
+        int fd = open("/proc/self/setgroups", O_WRONLY);
+        if (fd >= 0) { (void)!write(fd, "deny", 4); close(fd); }
+        fd = open("/proc/self/uid_map", O_WRONLY);
+        if (fd < 0) _exit(1);
+        char map[64];
+        int n = snprintf(map, sizeof map, "0 %d 1", (int)getuid());
+        bool ok = (n > 0 && write(fd, map, (size_t)n) == n);
+        close(fd);
+        _exit(ok ? 0 : 1);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return false;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+static void ensureWebKitCanLaunch() {
+    if (g_getenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS")) return;
+    if (userNamespacesUsable()) return;
+    g_message("[BeadsViewer] user namespaces unavailable (AppArmor userns "
+              "restriction?) — disabling the WebKit sandbox so the app can run");
+    g_setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1", TRUE);
+}
 
 // ── app state ────────────────────────────────────────────────────────────────
 struct App {
@@ -31,11 +69,23 @@ static std::string resolveResourcesDir() {
         buf[n] = '\0';
         gchar *dir = g_path_get_dirname(buf);
         std::string res = std::string(dir) + "/resources";
+        // Dev-build layout: binary in build/, resources beside the source
+        // tree. (Built BEFORE g_free(dir) — the first version of this
+        // fallback read `dir` after freeing it and probed a garbage path.)
+        std::string dev = std::string(dir) + "/../resources";
         g_free(dir);
         if (g_file_test((res + "/viewer/index.html").c_str(), G_FILE_TEST_EXISTS)) return res;
-        // Installed layout fallback: <prefix>/share/beadsviewer/resources
-        std::string share = "/usr/share/beadsviewer/resources";
-        if (g_file_test((share + "/viewer/index.html").c_str(), G_FILE_TEST_EXISTS)) return share;
+        if (g_file_test((dev + "/viewer/index.html").c_str(), G_FILE_TEST_EXISTS)) return dev;
+        // Installed layouts: <prefix>/share/beadsviewer/resources for the
+        // prefixes we ship to (XDG user dir, /usr/local, /usr).
+        const std::string shares[] = {
+            std::string(g_get_user_data_dir()) + "/beadsviewer/resources",
+            "/usr/local/share/beadsviewer/resources",
+            "/usr/share/beadsviewer/resources",
+        };
+        for (const auto &share : shares)
+            if (g_file_test((share + "/viewer/index.html").c_str(), G_FILE_TEST_EXISTS))
+                return share;
         return res;
     }
     return "";
@@ -45,6 +95,7 @@ static void rebuildMenuBar();
 
 static std::string titleForProject(const std::shared_ptr<BeadsProject> &p) {
     if (!p || p->projectRoot.empty()) return "BeadsViewer";
+    if (p->isRemote()) return "BeadsViewer — " + p->remoteDisplay;
     gchar *b = g_path_get_basename(p->projectRoot.c_str());
     std::string t = std::string("BeadsViewer — ") + (b ? b : "");
     g_free(b);
@@ -85,6 +136,7 @@ static void openWindowForProject(std::shared_ptr<BeadsProject> proj) {
     gtk_window_set_child(GTK_WINDOW(win), panel->widget());
     gtk_window_set_title(GTK_WINDOW(win), titleForProject(proj).c_str());
 
+    gtk_window_set_icon_name(GTK_WINDOW(win), "org.nextpadplusplus.BeadsViewer");
     g_object_set_data(G_OBJECT(win), "beads-panel", panel);
     g_app.windows.push_back(GTK_WINDOW(win));
 
@@ -152,18 +204,34 @@ static void act_newwindow(GSimpleAction *, GVariant *, gpointer) { openWindowFor
 static void act_reload(GSimpleAction *, GVariant *, gpointer)    { if (auto *p = activePanel()) p->reloadData(); }
 static void act_reveal(GSimpleAction *, GVariant *, gpointer)    { if (auto *p = activePanel()) p->openBeadsDir(); }
 static void act_close(GSimpleAction *, GVariant *, gpointer)     { if (auto *w = activeWindow()) gtk_window_close(w); }
-static void act_quit(GSimpleAction *, GVariant *, gpointer)      { g_application_quit(G_APPLICATION(g_app.app)); }
+static void act_quit(GSimpleAction *, GVariant *, gpointer) {
+    // Close every window FIRST so each panel destructor runs and stops its
+    // live-sync children (events tail / remote fetcher) — the macOS shell's
+    // applicationWillTerminate parity; a bare quit leaks the bd child.
+    auto wins = g_app.windows;              // destroy mutates the vector
+    for (GtkWindow *w : wins) gtk_window_destroy(w);
+    g_application_quit(G_APPLICATION(g_app.app));
+}
 static void act_github(GSimpleAction *, GVariant *, gpointer) {
     g_app_info_launch_default_for_uri("https://github.com/gastownhall/beads", nullptr, nullptr);
 }
 static void act_about(GSimpleAction *, GVariant *, gpointer) {
-    GtkAlertDialog *a = gtk_alert_dialog_new("BeadsViewer");
+    GtkAlertDialog *a = gtk_alert_dialog_new("BeadsViewer " BEADSVIEWER_VERSION);
     gtk_alert_dialog_set_detail(a,
         "Standalone viewer for the Beads (bd) issue tracker.\n"
-        "Same panel + viewer as the Nextpad++ NppBeads plugin.\n\n"
+        "Same panel + viewer as the Nextpad++ NppBeads plugin:\n"
+        "local projects (bd \u2265 1.3, Dolt or issues.jsonl) and read-only\n"
+        "remote repositories over HTTP(S).\n\n"
         "Beads: https://github.com/gastownhall/beads");
     gtk_alert_dialog_show(a, activeWindow());
     g_object_unref(a);
+}
+static void act_openremote(GSimpleAction *, GVariant *param, gpointer) {
+    const char *v = g_variant_get_string(param, nullptr);
+    const char *sep = v ? strchr(v, '\x1f') : nullptr;
+    if (!sep) return;
+    auto proj = BeadsProjectScanner::remoteProject(std::string(v, sep - v), sep + 1);
+    if (proj) openWindowForProject(proj);
 }
 static void act_openrecent(GSimpleAction *, GVariant *param, gpointer) {
     const char *root = g_variant_get_string(param, nullptr);
@@ -208,6 +276,24 @@ static void rebuildMenuBar() {
         g_menu_append_section(recent, nullptr, G_MENU_MODEL(clear));
         g_object_unref(clear);
     }
+    // Recent remote connections (\U0001f310 section, parity with the panel's
+    // switcher): the manager persona lives in the shell too.
+    {
+        auto remotes = BeadsRecent::loadRemotes();
+        if (!remotes.empty()) {
+            GMenu *sec = g_menu_new();
+            for (auto &e : remotes) {
+                GMenuItem *it = g_menu_item_new(("\U0001f310 " + e.display).c_str(), nullptr);
+                std::string packed = e.spec + '\x1f' + e.display;
+                g_menu_item_set_action_and_target_value(it, "app.openremote",
+                    g_variant_new_string(packed.c_str()));
+                g_menu_append_item(sec, it);
+                g_object_unref(it);
+            }
+            g_menu_append_section(recent, nullptr, G_MENU_MODEL(sec));
+            g_object_unref(sec);
+        }
+    }
     g_menu_append_submenu(file, "Open Recent", G_MENU_MODEL(recent));
     g_object_unref(recent);
     g_menu_append(file, "New Window", "app.newwindow");
@@ -247,6 +333,7 @@ static void installActions() {
         { "about",       G_CALLBACK(act_about),       nullptr },
         { "clearrecent", G_CALLBACK(act_clearrecent), nullptr },
         { "openrecent",  G_CALLBACK(act_openrecent),  G_VARIANT_TYPE_STRING },
+        { "openremote",  G_CALLBACK(act_openremote),  G_VARIANT_TYPE_STRING },
     };
     for (auto &a : acts) {
         GSimpleAction *act = g_simple_action_new(a.name, a.param);
@@ -273,10 +360,18 @@ static void on_startup(GtkApplication *, gpointer) {
     rebuildMenuBar();
 }
 static void on_activate(GtkApplication *, gpointer) {
-    // Resume the most-recent resolvable project; else open an empty window
-    // (or the folder dialog on a truly empty first run).
+    // Resume the most-recent resolvable project; with no resolvable LOCAL
+    // project, fall back to the most recent REMOTE connection (the manager
+    // persona — macOS nppmac-0th launch-restore parity); else an empty
+    // window + the folder dialog on a truly empty first run.
     for (auto &root : BeadsRecent::load()) {
         auto proj = BeadsProjectScanner::projectFromRoot(root);
+        if (proj) { openWindowForProject(proj); return; }
+    }
+    auto remotes = BeadsRecent::loadRemotes();
+    if (!remotes.empty()) {
+        auto proj = BeadsProjectScanner::remoteProject(remotes.front().spec,
+                                                       remotes.front().display);
         if (proj) { openWindowForProject(proj); return; }
     }
     openWindowForProject(nullptr);
@@ -295,10 +390,36 @@ static void on_open(GApplication *, gpointer files, gint n, const char *, gpoint
     if (!any) openWindowForProject(nullptr);
 }
 
+// Safety net (macOS NSApplicationWillTerminateNotification parity): if the
+// loop ends with windows still alive (SIGTERM, g_application_quit from
+// elsewhere), stop each panel's live-sync children before the process exits —
+// a leaked `bd events tail` polls the workspace forever.
+static void on_shutdown(GApplication *, gpointer) {
+    for (GtkWindow *w : g_app.windows) {
+        auto *p = static_cast<BeadsPanel *>(g_object_get_data(G_OBJECT(w), "beads-panel"));
+        delete p;   // stops tail/poll/remote; process is exiting anyway
+        g_object_set_data(G_OBJECT(w), "beads-panel", nullptr);
+    }
+    g_app.windows.clear();
+}
+
+static gboolean on_unix_signal(gpointer) {
+    // SIGTERM/SIGINT/SIGHUP → the same clean path as File ▸ Quit: close the
+    // windows (panel dtors stop the bd children), then leave the loop. The
+    // host app gained the identical discipline with its crash-recovery work.
+    act_quit(nullptr, nullptr, nullptr);
+    return G_SOURCE_REMOVE;
+}
+
 int main(int argc, char **argv) {
+    ensureWebKitCanLaunch();   // before ANY WebKit init
+    g_unix_signal_add(SIGTERM, on_unix_signal, nullptr);
+    g_unix_signal_add(SIGINT,  on_unix_signal, nullptr);
+    g_unix_signal_add(SIGHUP,  on_unix_signal, nullptr);
     g_app.app = ADW_APPLICATION(adw_application_new(
         "org.nextpadplusplus.BeadsViewer", G_APPLICATION_HANDLES_OPEN));
     g_signal_connect(g_app.app, "startup",  G_CALLBACK(on_startup), nullptr);
+    g_signal_connect(g_app.app, "shutdown", G_CALLBACK(on_shutdown), nullptr);
     g_signal_connect(g_app.app, "activate", G_CALLBACK(on_activate), nullptr);
     g_signal_connect(g_app.app, "open",     G_CALLBACK(on_open), nullptr);
     int rc = g_application_run(G_APPLICATION(g_app.app), argc, argv);
