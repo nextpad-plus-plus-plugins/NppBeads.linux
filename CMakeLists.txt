@@ -62,9 +62,11 @@ target_link_libraries(beads_selftest PRIVATE beads_core)
 # ─────────────────────────────────────────────────────────────────────────
 set(NPPBEADS_INSTALL_DIR "$ENV{HOME}/.local/share/nextpad++/plugins/NppBeads"
     CACHE PATH "Where to install the plugin folder")
-install(TARGETS NppBeads DESTINATION "${NPPBEADS_INSTALL_DIR}")
-install(FILES resources/toolbar.png DESTINATION "${NPPBEADS_INSTALL_DIR}/resources")
+install(TARGETS NppBeads DESTINATION "${NPPBEADS_INSTALL_DIR}" COMPONENT plugin)
+install(FILES resources/toolbar.png DESTINATION "${NPPBEADS_INSTALL_DIR}/resources"
+    COMPONENT plugin)
 install(DIRECTORY resources/viewer DESTINATION "${NPPBEADS_INSTALL_DIR}/resources"
+    COMPONENT plugin
     PATTERN ".git" EXCLUDE PATTERN ".DS_Store" EXCLUDE PATTERN ".gitignore" EXCLUDE)
 
 # Distributable zip: NppBeads/NppBeads.so + NppBeads/resources/...
@@ -95,12 +97,14 @@ target_link_libraries(BeadsViewer PRIVATE beads_view)
 
 # System install (binary → bin/, viewer → share/beadsviewer/resources — the
 # resolveResourcesDir() fallback path — plus a .desktop launcher).
-install(TARGETS BeadsViewer RUNTIME DESTINATION bin)
-install(FILES resources/toolbar.png DESTINATION share/beadsviewer/resources)
+install(TARGETS BeadsViewer RUNTIME DESTINATION bin COMPONENT app)
+install(FILES resources/toolbar.png DESTINATION share/beadsviewer/resources
+    COMPONENT app)
 install(DIRECTORY resources/viewer DESTINATION share/beadsviewer/resources
+    COMPONENT app
     PATTERN ".git" EXCLUDE PATTERN ".DS_Store" EXCLUDE PATTERN ".gitignore" EXCLUDE)
 configure_file(shell-app/org.nextpadplusplus.BeadsViewer.desktop.in
     ${CMAKE_BINARY_DIR}/org.nextpadplusplus.BeadsViewer.desktop @ONLY)
 install(FILES ${CMAKE_BINARY_DIR}/org.nextpadplusplus.BeadsViewer.desktop
-    DESTINATION share/applications)
-install(DIRECTORY shell-app/icons/hicolor DESTINATION share/icons)
+    DESTINATION share/applications COMPONENT app)
+install(DIRECTORY shell-app/icons/hicolor DESTINATION share/icons COMPONENT app)

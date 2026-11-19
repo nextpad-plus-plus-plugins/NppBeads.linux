@@ -218,8 +218,7 @@ static void act_github(GSimpleAction *, GVariant *, gpointer) {
 static void act_about(GSimpleAction *, GVariant *, gpointer) {
     GtkAlertDialog *a = gtk_alert_dialog_new("BeadsViewer " BEADSVIEWER_VERSION);
     gtk_alert_dialog_set_detail(a,
-        "Standalone viewer for the Beads (bd) issue tracker.\n"
-        "Same panel + viewer as the Nextpad++ NppBeads plugin:\n"
+        "Standalone viewer for the Beads (bd) issue tracker:\n"
         "local projects (bd \u2265 1.3, Dolt or issues.jsonl) and read-only\n"
         "remote repositories over HTTP(S).\n\n"
         "Beads: https://github.com/gastownhall/beads");
