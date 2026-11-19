@@ -411,6 +411,25 @@ static gboolean on_unix_signal(gpointer) {
     return G_SOURCE_REMOVE;
 }
 
+// --new-window: the dock icon's "New Window" desktop action (and a plain CLI
+// convenience). On a RUNNING app the second process forwards the app-level
+// "newwindow" action to the primary over D-Bus (GApplication exports its
+// GActionGroup) and exits; on a cold start it falls through to the normal
+// activate (MRU resume) — the GNOME Terminal convention.
+static gint on_handle_local_options(GApplication *app, GVariantDict *opts, gpointer) {
+    if (!g_variant_dict_contains(opts, "new-window")) return -1;  // continue
+    GError *err = nullptr;
+    if (!g_application_register(app, nullptr, &err)) {
+        if (err) { g_warning("register: %s", err->message); g_error_free(err); }
+        return 1;
+    }
+    if (g_application_get_is_remote(app)) {
+        g_action_group_activate_action(G_ACTION_GROUP(app), "newwindow", nullptr);
+        return 0;   // remote done — primary opened the window
+    }
+    return -1;      // we ARE the primary: proceed to normal activate
+}
+
 int main(int argc, char **argv) {
     ensureWebKitCanLaunch();   // before ANY WebKit init
     g_unix_signal_add(SIGTERM, on_unix_signal, nullptr);
@@ -418,6 +437,11 @@ int main(int argc, char **argv) {
     g_unix_signal_add(SIGHUP,  on_unix_signal, nullptr);
     g_app.app = ADW_APPLICATION(adw_application_new(
         "org.nextpadplusplus.BeadsViewer", G_APPLICATION_HANDLES_OPEN));
+    g_application_add_main_option(G_APPLICATION(g_app.app), "new-window", 'n',
+        G_OPTION_FLAG_NONE, G_OPTION_ARG_NONE,
+        "Open a new window (focuses the running instance's app)", nullptr);
+    g_signal_connect(g_app.app, "handle-local-options",
+                     G_CALLBACK(on_handle_local_options), nullptr);
     g_signal_connect(g_app.app, "startup",  G_CALLBACK(on_startup), nullptr);
     g_signal_connect(g_app.app, "shutdown", G_CALLBACK(on_shutdown), nullptr);
     g_signal_connect(g_app.app, "activate", G_CALLBACK(on_activate), nullptr);
